@@ -155,24 +155,17 @@ server {
     listen 80 default_server;
     server_name _;
 
-    root /REPLACE_WITH_FRONTEND_DIST;
-    index index.html;
-
-    location /api/ {
-        proxy_pass http://127.0.0.1:8000/api/;
+    location / {
+        proxy_pass http://127.0.0.1:8000/;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_read_timeout 120;
-    }
-
-    location / {
-        try_files $uri $uri/ /index.html;
+        proxy_send_timeout 120;
     }
 }
 EOF
-        # Patch in the real frontend dist path
-        sudo sed -i "s|/REPLACE_WITH_FRONTEND_DIST|${REPO_DIR}/frontend/dist|g" "$NGINX_CONF"
 
         sudo ln -sf "$NGINX_CONF" /etc/nginx/sites-enabled/gphoto2-astro-webui
         sudo rm -f /etc/nginx/sites-enabled/default

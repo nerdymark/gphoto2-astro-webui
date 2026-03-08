@@ -46,8 +46,19 @@ def get_camera_summary() -> dict:
     try:
         result = _run(["--summary"])
         return {"connected": True, "model": "", "summary": result.stdout}
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        stdout = (exc.stdout or "").strip()
+        logger.error(
+            "get_camera_summary failed (exit %d): stderr=%r stdout=%r",
+            exc.returncode,
+            stderr,
+            stdout,
+        )
+        detail = stderr or stdout or f"exit code {exc.returncode}"
+        return {"connected": False, "model": "", "summary": f"Error: {detail}"}
     except Exception as exc:
-        logger.error("get_camera_summary failed: %s", exc)
+        logger.error("get_camera_summary unexpected error: %s", exc)
         return {"connected": False, "model": "", "summary": str(exc)}
 
 

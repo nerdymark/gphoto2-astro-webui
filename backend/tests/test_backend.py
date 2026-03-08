@@ -58,6 +58,27 @@ class TestCameraModule:
             saved = cam.capture_image(tmp_path)
         assert saved.exists()
 
+    def test_get_camera_summary_gphoto2_error_logs_stderr(self):
+        """CalledProcessError from gphoto2 --summary should log stderr and return connected=False."""
+        import subprocess
+        import camera as cam
+
+        fake_exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["/usr/bin/gphoto2", "--summary"],
+            stderr="*** Error (-53: 'Could not claim the USB device')",
+            output="",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=fake_exc),
+        ):
+            result = cam.get_camera_summary()
+
+        assert result["connected"] is False
+        assert "Could not claim the USB device" in result["summary"]
+
 
 # ---------------------------------------------------------------------------
 # stacking module tests
