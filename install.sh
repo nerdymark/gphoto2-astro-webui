@@ -52,11 +52,31 @@ sudo apt-get install -y -qq \
     git \
     curl
 
-# Node.js (v20 LTS via NodeSource)
+# Node.js (v20 LTS)
 if ! command -v node &>/dev/null; then
-    info "Installing Node.js 20 LTS…"
-    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-    sudo apt-get install -y nodejs
+    # Detect architecture; NodeSource does not support armhf (32-bit ARM).
+    # On armhf/armv7l use the official nodejs.org binary instead.
+    SYS_ARCH=$(dpkg --print-architecture 2>/dev/null || uname -m)
+    if [[ "$SYS_ARCH" == "armhf" || "$SYS_ARCH" == "armv7l" ]]; then
+        info "Detected armhf – NodeSource does not support this architecture."
+        info "Installing Node.js 20 LTS from nodejs.org for armv7l…"
+        NODE_VER=$(curl -fsSL https://nodejs.org/dist/latest-v20.x/ \
+            | grep -oP 'node-v\K[0-9.]+(?=-linux-armv7l\.tar\.xz)' \
+            | head -1)
+        if [[ -z "$NODE_VER" ]]; then
+            error "Could not determine latest Node.js 20 LTS version from nodejs.org."
+        fi
+        curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-linux-armv7l.tar.xz" \
+            -o /tmp/nodejs-armv7l.tar.xz \
+            || error "Failed to download Node.js ${NODE_VER} for armv7l."
+        sudo tar -xf /tmp/nodejs-armv7l.tar.xz -C /usr/local --strip-components=1 \
+            || error "Failed to extract Node.js tarball."
+        rm -f /tmp/nodejs-armv7l.tar.xz
+    else
+        info "Installing Node.js 20 LTS via NodeSource…"
+        curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+        sudo apt-get install -y nodejs
+    fi
 else
     info "Node.js already installed: $(node --version)"
 fi
