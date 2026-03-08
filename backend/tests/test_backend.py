@@ -521,6 +521,102 @@ class TestCameraModule:
             "Expected a WARNING about capturetarget not being set"
         )
 
+    def test_list_config_keys_no_binary(self):
+        """list_config_keys returns [] when gphoto2 is not available."""
+        import camera as cam
+
+        with patch.object(cam, "GPHOTO2_BIN", None):
+            assert cam.list_config_keys() == []
+
+    def test_list_config_keys_returns_paths(self):
+        """list_config_keys parses each non-empty line from --list-config output."""
+        import camera as cam
+
+        output = (
+            "/main/imgsettings/iso\n"
+            "/main/imgsettings/whitebalance\n"
+            "/main/capturesettings/shutterspeed\n"
+        )
+        ok_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=output, stderr=""
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", return_value=ok_result),
+        ):
+            keys = cam.list_config_keys()
+
+        assert keys == [
+            "/main/imgsettings/iso",
+            "/main/imgsettings/whitebalance",
+            "/main/capturesettings/shutterspeed",
+        ]
+
+    def test_list_config_keys_error_returns_empty(self, caplog):
+        """list_config_keys logs an error and returns [] when gphoto2 fails."""
+        import camera as cam
+
+        fake_exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["/usr/bin/gphoto2", "--list-config"],
+            stderr="*** Error (-53: 'Could not claim the USB device')",
+            output="",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", side_effect=fake_exc),
+            caplog.at_level(logging.ERROR, logger="camera"),
+        ):
+            keys = cam.list_config_keys()
+
+        assert keys == []
+        assert any("list_config_keys" in r.message for r in caplog.records)
+
+    def test_run_logs_debug_command(self, caplog):
+        """_run must log the command at DEBUG level before invoking subprocess."""
+        import camera as cam
+
+        ok_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Camera OK", stderr=""
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch("camera.subprocess.run", return_value=ok_result),
+            caplog.at_level(logging.DEBUG, logger="camera"),
+        ):
+            cam._run(["--summary"])
+
+        debug_messages = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any("--summary" in m for m in debug_messages), (
+            "Expected a DEBUG log containing the gphoto2 command arguments"
+        )
+
+    def test_capture_image_logs_debug_output(self, tmp_path, caplog):
+        """capture_image must log gphoto2 stdout/stderr at DEBUG level after capture."""
+        import camera as cam
+
+        def mock_run(args, check=True, cwd=None):
+            if "--capture-image-and-download" in args and cwd:
+                (Path(cwd) / "20240308-173422-00001.JPG").write_bytes(b"\xff\xd8fake")
+            return subprocess.CompletedProcess(
+                args=args, returncode=0,
+                stdout="New file is in location /store_00010001/DCIM/100CANON/IMG_0001.CR3",
+                stderr="",
+            )
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+            caplog.at_level(logging.DEBUG, logger="camera"),
+        ):
+            cam.capture_image(tmp_path)
+
+        debug_messages = " ".join(r.message for r in caplog.records if r.levelno == logging.DEBUG)
+        assert "capture_image" in debug_messages, (
+            "Expected DEBUG log entries from capture_image"
+        )
+
 
 # ---------------------------------------------------------------------------
 # stacking module tests
@@ -639,6 +735,35 @@ class TestAPI:
         assert resp.status_code == 200
         data = resp.json()
         assert "connected" in data
+
+    def test_list_config_keys_endpoint(self, client):
+        import camera as cam
+
+        with patch.object(cam, "GPHOTO2_BIN", None):
+            resp = client.get("/api/camera/config-keys")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "keys" in data
+        assert isinstance(data["keys"], list)
+
+    def test_list_config_keys_endpoint_returns_keys(self, client):
+        import camera as cam
+
+        ok_result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="/main/imgsettings/iso\n/main/capturesettings/shutterspeed\n",
+            stderr="",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", return_value=ok_result),
+        ):
+            resp = client.get("/api/camera/config-keys")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "/main/imgsettings/iso" in data["keys"]
+        assert "/main/capturesettings/shutterspeed" in data["keys"]
 
     def test_get_exposure(self, client):
         resp = client.get("/api/camera/exposure")

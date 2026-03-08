@@ -79,10 +79,17 @@ def _run(
     downloaded files land in a known temporary directory).
     """
     cmd = [GPHOTO2_BIN] + args
+    logger.debug("_run: %s (cwd=%s)", " ".join(cmd), cwd)
     with _camera_lock:
         for attempt in range(_USB_MAX_ATTEMPTS):
             result = subprocess.run(
                 cmd, capture_output=True, text=True, check=False, timeout=30, cwd=cwd
+            )
+            logger.debug(
+                "_run returncode=%d stdout=%r stderr=%r",
+                result.returncode,
+                (result.stdout or "").strip(),
+                (result.stderr or "").strip(),
             )
             if USB_CLAIM_ERROR not in (result.stderr or "") or attempt >= _USB_MAX_ATTEMPTS - 1:
                 break
@@ -220,6 +227,34 @@ def _get_config(key: str) -> tuple[Optional[str], list[str]]:
     return None, []
 
 
+def list_config_keys() -> list[str]:
+    """Return all configuration key paths supported by the connected camera.
+
+    Runs ``gphoto2 --list-config`` and returns the list of key paths (e.g.
+    ``/main/imgsettings/iso``).  This is useful for diagnosing which settings
+    are available on a specific camera model.
+
+    Returns an empty list when gphoto2 is unavailable, the camera is not
+    connected, or any other error occurs (the error is logged).
+    """
+    if not GPHOTO2_BIN:
+        return []
+    try:
+        result = _run(["--list-config"])
+        keys = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        logger.debug("list_config_keys: found %d keys", len(keys))
+        return keys
+    except subprocess.CalledProcessError as exc:
+        logger.error(
+            "list_config_keys failed (exit %d): %s",
+            exc.returncode,
+            (exc.stderr or "").strip() or (exc.stdout or "").strip(),
+        )
+    except Exception as exc:
+        logger.error("list_config_keys unexpected error: %s", exc)
+    return []
+
+
 def get_exposure_settings() -> dict:
     """Return current aperture, shutter speed, and ISO.
 
@@ -299,7 +334,8 @@ def capture_image(gallery_path: Path) -> Path:
                     "capture_image: could not set capturetarget=0: %s",
                     (ct.stderr or "").strip(),
                 )
-            _run(
+            logger.debug("capture_image: starting capture into tmpdir=%s", tmpdir)
+            result = _run(
                 [
                     "--capture-image-and-download",
                     "--filename",
@@ -311,18 +347,33 @@ def capture_image(gallery_path: Path) -> Path:
                 ],
                 cwd=tmpdir,
             )
+            logger.debug(
+                "capture_image: gphoto2 stdout=%r stderr=%r",
+                (result.stdout or "").strip(),
+                (result.stderr or "").strip(),
+            )
             captured = list(Path(tmpdir).iterdir())
+            logger.debug("capture_image: files in tmpdir after capture: %s", captured)
             if not captured:
                 logger.error(
                     "capture_image: gphoto2 exited successfully but no file was downloaded"
+                    " – stdout=%r stderr=%r",
+                    (result.stdout or "").strip(),
+                    (result.stderr or "").strip(),
                 )
                 raise RuntimeError("gphoto2 captured nothing")
             src = captured[0]
             dst = gallery_path / src.name
             shutil.move(str(src), str(dst))
+            logger.debug("capture_image: saved %s -> %s", src, dst)
             return dst
         except subprocess.CalledProcessError as exc:
-            logger.error("capture_image failed: %s", exc.stderr)
+            logger.error(
+                "capture_image failed (exit %d): stderr=%r stdout=%r",
+                exc.returncode,
+                (exc.stderr or "").strip(),
+                (exc.stdout or "").strip(),
+            )
             raise RuntimeError(f"Capture failed: {exc.stderr}") from exc
 
 

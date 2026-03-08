@@ -3,6 +3,7 @@ FastAPI backend for gphoto2-astro-webui.
 
 Endpoints:
   GET  /api/camera/status        – camera connection & summary
+  GET  /api/camera/config-keys   – list all config keys supported by the camera
   GET  /api/camera/exposure      – get current exposure settings + choices
   POST /api/camera/exposure      – set exposure settings
   POST /api/camera/capture       – capture one image into a gallery
@@ -80,6 +81,13 @@ class CreateGalleryRequest(BaseModel):
 @app.get("/api/camera/status")
 def camera_status():
     return cam.get_camera_summary()
+
+
+@app.get("/api/camera/config-keys")
+def list_config_keys():
+    """Return the list of configuration key paths supported by the connected camera."""
+    keys = cam.list_config_keys()
+    return {"keys": keys}
 
 
 @app.get("/api/camera/exposure")
