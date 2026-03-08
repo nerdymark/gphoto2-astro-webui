@@ -7,7 +7,6 @@ Falls back to a simulated camera when gphoto2 is not available (development mode
 
 import io
 import logging
-import os
 import shutil
 import subprocess
 import tempfile
@@ -67,11 +66,24 @@ def _kill_gvfs_monitor() -> None:
     time.sleep(3)
 
 
-def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+def _run(
+    args: list[str], check: bool = True, cwd: Optional[str] = None
+) -> subprocess.CompletedProcess:
+    """Execute a gphoto2 command with automatic USB conflict resolution.
+
+    *check* controls whether a non-zero exit code raises
+    :class:`subprocess.CalledProcessError` (default ``True``).
+
+    *cwd* is passed directly to :func:`subprocess.run` so callers can control
+    the working directory (e.g. for ``--capture-image-and-download`` so that
+    downloaded files land in a known temporary directory).
+    """
     cmd = [GPHOTO2_BIN] + args
     with _camera_lock:
         for attempt in range(_USB_MAX_ATTEMPTS):
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, check=False, timeout=30, cwd=cwd
+            )
             if USB_CLAIM_ERROR not in (result.stderr or "") or attempt >= _USB_MAX_ATTEMPTS - 1:
                 break
             _kill_gvfs_monitor()
@@ -165,18 +177,72 @@ def _get_config_choices(key: str) -> list[str]:
     return []
 
 
+def _get_config(key: str) -> tuple[Optional[str], list[str]]:
+    """Return ``(current_value, choices)`` for a camera config key.
+
+    Both the current value and the list of choices are parsed from a **single**
+    ``gphoto2 --get-config`` invocation, halving the number of subprocess calls
+    compared with calling :func:`_get_config_value` and
+    :func:`_get_config_choices` separately.
+
+    Returns ``(None, [])`` when the key is not in the camera's config tree or
+    gphoto2 is unavailable.
+    """
+    if not GPHOTO2_BIN:
+        return None, []
+    try:
+        result = _run(["--get-config", key])
+        value: Optional[str] = None
+        choices: list[str] = []
+        for line in result.stdout.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("Current:"):
+                value = stripped.split(":", 1)[1].strip()
+            elif stripped.startswith("Choice:"):
+                # "Choice: 0 1/4000"
+                parts = stripped.split(None, 2)
+                if len(parts) == 3:
+                    choices.append(parts[2])
+        return value, choices
+    except subprocess.CalledProcessError as exc:
+        logger.error(
+            "_get_config(%r) failed (exit %d): %s",
+            key,
+            exc.returncode,
+            (exc.stderr or "").strip() or (exc.stdout or "").strip(),
+        )
+    except Exception as exc:
+        logger.error("_get_config(%r) unexpected error: %s", key, exc)
+    return None, []
+
+
 def get_exposure_settings() -> dict:
-    """Return current aperture, shutter speed, and ISO."""
-    aperture = _get_config_value("aperture") or _get_config_value("f-number")
-    shutter = _get_config_value("shutterspeed") or _get_config_value("shutterspeed2")
-    iso = _get_config_value("iso")
+    """Return current aperture, shutter speed, and ISO.
+
+    Each setting is fetched with a single ``gphoto2 --get-config`` call that
+    returns both the current value and the list of available choices.  When the
+    primary key is not found in the camera's config tree the secondary key is
+    tried (e.g. ``f-number`` when ``aperture`` is absent).  This avoids making
+    separate calls for value and choices when the first key fails, reducing the
+    number of subprocess invocations and the time the camera lock is held.
+    """
+    aperture, aperture_choices = _get_config("aperture")
+    if aperture is None and not aperture_choices:
+        aperture, aperture_choices = _get_config("f-number")
+
+    shutter, shutter_choices = _get_config("shutterspeed")
+    if shutter is None and not shutter_choices:
+        shutter, shutter_choices = _get_config("shutterspeed2")
+
+    iso, iso_choices = _get_config("iso")
+
     return {
         "aperture": aperture,
         "shutter": shutter,
         "iso": iso,
-        "aperture_choices": _get_config_choices("aperture") or _get_config_choices("f-number"),
-        "shutter_choices": _get_config_choices("shutterspeed") or _get_config_choices("shutterspeed2"),
-        "iso_choices": _get_config_choices("iso"),
+        "aperture_choices": aperture_choices,
+        "shutter_choices": shutter_choices,
+        "iso_choices": iso_choices,
     }
 
 
@@ -223,12 +289,19 @@ def capture_image(gallery_path: Path) -> Path:
                 [
                     "--capture-image-and-download",
                     "--filename",
-                    os.path.join(tmpdir, "%Y%m%d-%H%M%S-%05n.%C"),
+                    # Basename only – gphoto2 expands format codes and writes the
+                    # file relative to cwd (tmpdir), which is more reliable than
+                    # embedding an absolute path in the --filename template.
+                    "%Y%m%d-%H%M%S-%05n.%C",
                     "--force-overwrite",
                 ],
+                cwd=tmpdir,
             )
             captured = list(Path(tmpdir).iterdir())
             if not captured:
+                logger.error(
+                    "capture_image: gphoto2 exited successfully but no file was downloaded"
+                )
                 raise RuntimeError("gphoto2 captured nothing")
             src = captured[0]
             dst = gallery_path / src.name

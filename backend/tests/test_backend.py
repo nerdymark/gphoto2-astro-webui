@@ -237,6 +237,192 @@ class TestCameraModule:
         # The lock ensures gphoto2 is never called concurrently
         assert max_concurrent[0] == 1
 
+    def test_run_passes_cwd_to_subprocess(self, tmp_path):
+        """_run must forward its cwd argument to subprocess.run."""
+        import camera as cam
+
+        received_cwd = []
+
+        def tracking_run(cmd, **kwargs):
+            received_cwd.append(kwargs.get("cwd"))
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="OK", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch("camera.subprocess.run", side_effect=tracking_run),
+        ):
+            cam._run(["--summary"], cwd=str(tmp_path))
+
+        assert received_cwd == [str(tmp_path)]
+
+    def test_get_config_returns_value_and_choices(self):
+        """_get_config parses both current value and choices in one gphoto2 call."""
+        import camera as cam
+
+        output = (
+            "Label: ISO Speed\nType: RADIO\n"
+            "Current: 800\n"
+            "Choice: 0 100\nChoice: 1 200\nChoice: 2 400\nChoice: 3 800\n"
+        )
+        ok_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=output, stderr=""
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", return_value=ok_result),
+        ):
+            value, choices = cam._get_config("iso")
+
+        assert value == "800"
+        assert choices == ["100", "200", "400", "800"]
+
+    def test_get_config_error_returns_none_and_empty(self, caplog):
+        """_get_config returns (None, []) and logs an error when gphoto2 fails."""
+        import camera as cam
+
+        fake_exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["/usr/bin/gphoto2", "--get-config", "aperture"],
+            stderr="aperture not found in configuration tree.",
+            output="",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", side_effect=fake_exc),
+            caplog.at_level(logging.ERROR, logger="camera"),
+        ):
+            value, choices = cam._get_config("aperture")
+
+        assert value is None
+        assert choices == []
+        assert any("aperture" in r.message for r in caplog.records)
+
+    def test_get_exposure_settings_falls_back_to_f_number(self):
+        """get_exposure_settings uses f-number when aperture is not found."""
+        import camera as cam
+
+        aperture_exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["/usr/bin/gphoto2", "--get-config", "aperture"],
+            stderr="aperture not found in configuration tree.",
+            output="",
+        )
+        f_number_output = (
+            "Label: F-Number\nType: RADIO\n"
+            "Current: f/4\n"
+            "Choice: 0 f/2.8\nChoice: 1 f/4\n"
+        )
+        f_number_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=f_number_output, stderr=""
+        )
+        generic_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Current: 1/100\n", stderr=""
+        )
+
+        def mock_run(args, **kwargs):
+            if "--get-config" in args:
+                key = args[args.index("--get-config") + 1]
+                if key == "aperture":
+                    raise aperture_exc
+                if key == "f-number":
+                    return f_number_result
+            return generic_result
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", side_effect=mock_run),
+        ):
+            settings = cam.get_exposure_settings()
+
+        assert settings["aperture"] == "f/4"
+        assert "f/2.8" in settings["aperture_choices"]
+
+    def test_get_exposure_settings_no_duplicate_aperture_calls_on_failure(self):
+        """When aperture is unsupported, _get_config must NOT be called a second time
+        for the same key when collecting choices (single combined call per key)."""
+        import camera as cam
+
+        call_log: list[str] = []
+
+        aperture_exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["/usr/bin/gphoto2", "--get-config", "aperture"],
+            stderr="aperture not found in configuration tree.",
+            output="",
+        )
+        generic_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Current: 1/100\n", stderr=""
+        )
+
+        def mock_run(args, **kwargs):
+            if "--get-config" in args:
+                key = args[args.index("--get-config") + 1]
+                call_log.append(key)
+                if key == "aperture":
+                    raise aperture_exc
+            return generic_result
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", side_effect=mock_run),
+        ):
+            cam.get_exposure_settings()
+
+        # "aperture" must appear exactly once – the new _get_config() helper
+        # retrieves value and choices in a single call.
+        assert call_log.count("aperture") == 1, (
+            f"aperture was queried {call_log.count('aperture')} time(s); expected 1. "
+            f"Full call log: {call_log}"
+        )
+
+    def test_capture_image_uses_cwd_for_download(self, tmp_path):
+        """capture_image must pass cwd=tmpdir to _run so the downloaded file lands
+        in the temporary directory, not in the server's working directory."""
+        import camera as cam
+
+        captured_cwds: list = []
+
+        def mock_run(args, check=True, cwd=None):
+            captured_cwds.append(cwd)
+            if "--capture-image-and-download" in args and cwd:
+                # Simulate gphoto2 creating a file in cwd
+                (Path(cwd) / "20240308-173422-00001.JPG").write_bytes(b"\xff\xd8fake")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+        ):
+            result = cam.capture_image(tmp_path)
+
+        # File should have been moved from tmpdir into gallery_path
+        assert result.exists()
+        assert result.parent == tmp_path
+        # At least one _run call must have received a non-None cwd
+        assert any(cwd is not None for cwd in captured_cwds), (
+            "capture_image did not pass cwd to _run; file may land in the wrong directory"
+        )
+
+    def test_capture_image_gphoto2_nothing_logs_error(self, tmp_path, caplog):
+        """When gphoto2 exits 0 but downloads nothing, an error must be logged."""
+        import camera as cam
+
+        def mock_run(args, check=True, cwd=None):
+            # Do NOT write any file – simulate gphoto2 succeeding but not downloading
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+            caplog.at_level(logging.ERROR, logger="camera"),
+        ):
+            with pytest.raises(RuntimeError, match="gphoto2 captured nothing"):
+                cam.capture_image(tmp_path)
+
+        assert any("no file was downloaded" in r.message for r in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # stacking module tests
