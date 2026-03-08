@@ -937,3 +937,44 @@ def test_log_level_invalid_value_warns(monkeypatch, caplog):
 
     assert main._LOG_LEVEL == "TRACE"
     assert any("TRACE" in r.message for r in caplog.records)
+
+
+def test_log_level_sets_root_logger_level(monkeypatch):
+    """LOG_LEVEL must be applied to the root logger even when basicConfig is a no-op."""
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    if "main" in sys.modules:
+        del sys.modules["main"]
+    import main  # noqa: PLC0415
+
+    assert logging.root.level == logging.DEBUG
+
+
+def test_log_level_info_sets_root_logger_level(monkeypatch):
+    """Setting LOG_LEVEL=info must lower the root logger level to INFO."""
+    monkeypatch.setenv("LOG_LEVEL", "info")
+    if "main" in sys.modules:
+        del sys.modules["main"]
+    import main  # noqa: PLC0415
+
+    assert logging.root.level == logging.INFO
+
+
+def test_debug_messages_emitted_when_log_level_debug(monkeypatch, caplog):
+    """Debug messages from the camera logger must appear when LOG_LEVEL=DEBUG."""
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    # Reset root logger to WARNING to simulate uvicorn having already run
+    logging.root.setLevel(logging.WARNING)
+
+    if "main" in sys.modules:
+        del sys.modules["main"]
+    import main  # noqa: PLC0415
+
+    assert main._LOG_LEVEL == "DEBUG"
+    assert logging.root.level == logging.DEBUG
+
+    import camera as cam  # noqa: PLC0415
+
+    with caplog.at_level(logging.DEBUG, logger="camera"):
+        cam.logger.debug("test debug message from camera")
+
+    assert any("test debug message from camera" in r.message for r in caplog.records)
