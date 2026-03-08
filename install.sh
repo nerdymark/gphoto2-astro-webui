@@ -159,6 +159,21 @@ sudo apt-get install -y -qq \
 info "Removing any distro-packaged gphoto2/libgphoto2 (if installed)…"
 sudo apt-get remove -y -qq gphoto2 libgphoto2-dev libgphoto2-6 2>&1 || true
 
+# ---------------------------------------------------------------------------
+# Remove gvfs camera/MTP backends
+#
+# gvfs-backends ships the gphoto2 and MTP backends that auto-mount cameras
+# over PTP/MTP when a device is plugged in.  Even after masking the
+# gvfs-gphoto2-volume-monitor and gvfs-mtp-volume-monitor user services,
+# gvfs-udisks2-volume-monitor (provided by gvfs-backends) can still claim the
+# camera's USB interface and trigger "PTP Access Denied".  Removing the
+# backends package eliminates all gvfs camera/MTP code from the system.
+# gvfs-fuse provides the FUSE mount for gvfs; on a headless Raspberry Pi
+# used purely for astrophotography it is not required.
+# ---------------------------------------------------------------------------
+info "Removing gvfs camera/MTP backends (gvfs-backends, gvfs-fuse)…"
+sudo apt-get remove -y -qq gvfs-backends gvfs-fuse 2>&1 || true
+
 build_gphoto2_from_source
 
 # Register the locally built binary with update-alternatives so that
@@ -269,7 +284,7 @@ fi
 # ---------------------------------------------------------------------------
 # Disable GNOME VFS camera daemons
 #
-# Three groups of GNOME VFS processes auto-mount cameras over MTP/PTP and hold
+# Multiple GNOME VFS processes auto-mount cameras over MTP/PTP and hold
 # the USB interface, preventing gphoto2 from accessing the device:
 #
 #   gvfs-gphoto2-volume-monitor / gvfsd-gphoto2
@@ -282,19 +297,44 @@ fi
 #       at login and immediately claims the camera – this is the primary cause of
 #       the "PTP Access Denied" error reported by gphoto2.
 #
-# Mask both volume monitors so they no longer auto-start, and kill all four
-# processes now so the camera is immediately available.  No sudo is required
-# because all processes run as the current user (${USER}).
+#   gvfs-udisks2-volume-monitor
+#       Monitors udisks2 volume events and can also claim USB camera devices,
+#       continuing to cause "PTP Access Denied" even after the gphoto2/MTP
+#       monitors are masked.
+#
+#   gvfs-goa-volume-monitor, gvfs-afc-volume-monitor
+#       Additional volume monitors (GNOME Online Accounts, Apple File Connect)
+#       that start automatically on desktop sessions.  Masking them prevents
+#       unnecessary USB device scanning on a dedicated astrophotography system.
+#
+# Mask all volume monitors so they no longer auto-start, and kill all
+# remaining gvfs daemon processes so the camera is immediately available.
+# No sudo is required because all processes run as the current user (${USER}).
 # ---------------------------------------------------------------------------
-info "Masking GNOME VFS camera volume monitors and stopping their worker daemons…"
-systemctl --user mask gvfs-gphoto2-volume-monitor 2>/dev/null \
-    && systemctl --user stop gvfs-gphoto2-volume-monitor 2>/dev/null \
-    || warn "Could not mask gvfs-gphoto2-volume-monitor (may not be installed – this is fine)"
-systemctl --user mask gvfs-mtp-volume-monitor 2>/dev/null \
-    && systemctl --user stop gvfs-mtp-volume-monitor 2>/dev/null \
-    || warn "Could not mask gvfs-mtp-volume-monitor (may not be installed – this is fine)"
-pkill -f gvfsd-gphoto2 2>/dev/null || true
-pkill -f gvfsd-mtp 2>/dev/null || true
+info "Masking GNOME VFS volume monitors and stopping their worker daemons…"
+for _svc in \
+    gvfs-gphoto2-volume-monitor \
+    gvfs-mtp-volume-monitor \
+    gvfs-udisks2-volume-monitor \
+    gvfs-goa-volume-monitor \
+    gvfs-afc-volume-monitor
+do
+    systemctl --user mask "$_svc" 2>/dev/null \
+        && systemctl --user stop "$_svc" 2>/dev/null \
+        || true   # service may not be present on this system – that is fine
+done
+
+# Kill all gvfs worker daemons that may currently hold the camera interface.
+for _pat in \
+    gvfsd-gphoto2 \
+    gvfsd-mtp \
+    gvfsd-fuse \
+    gvfs-udisks2-volume-monitor \
+    gvfs-goa-volume-monitor \
+    gvfs-afc-volume-monitor
+do
+    pkill -f "$_pat" 2>/dev/null || true
+done
 
 # ---------------------------------------------------------------------------
 # 2. Python virtual environment
@@ -366,6 +406,10 @@ ExecStartPre=-/usr/bin/pkill -f gvfs-gphoto2-volume-monitor
 ExecStartPre=-/usr/bin/pkill -f gvfsd-gphoto2
 ExecStartPre=-/usr/bin/pkill -f gvfs-mtp-volume-monitor
 ExecStartPre=-/usr/bin/pkill -f gvfsd-mtp
+ExecStartPre=-/usr/bin/pkill -f gvfs-udisks2-volume-monitor
+ExecStartPre=-/usr/bin/pkill -f gvfs-goa-volume-monitor
+ExecStartPre=-/usr/bin/pkill -f gvfs-afc-volume-monitor
+ExecStartPre=-/usr/bin/pkill -f gvfsd-fuse
 ExecStart=${REPO_DIR}/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level \${LOG_LEVEL}
 Restart=on-failure
 RestartSec=5

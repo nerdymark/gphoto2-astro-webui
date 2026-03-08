@@ -156,5 +156,6 @@ pytest tests/ -v
 |---|---|
 | "No camera" shown | Check USB cable; run `gphoto2 --auto-detect` |
 | Camera busy/locked | The app handles this automatically; for manual recovery run `pkill -f gvfsd-gphoto2` |
+| "PTP Access Denied" on capture | A gvfs daemon is holding the camera USB interface. Run `install.sh` to remove `gvfs-backends` and mask all gvfs volume monitors, or manually: `sudo apt-get remove -y gvfs-backends gvfs-fuse && pkill -f gvfsd` |
 | Permission denied on USB | `sudo adduser $USER plugdev` then re-login |
 | Port 8000 in use | Change `--port` in the systemd service unit |
