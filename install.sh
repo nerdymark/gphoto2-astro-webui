@@ -4,7 +4,7 @@
 #
 # Usage:
 #   chmod +x install.sh
-#   ./install.sh [--dev]
+#   ./install.sh [--dev] [--build-gphoto2]
 #
 # What it does:
 #   1. Installs system dependencies (gphoto2, python3-venv, Node.js, nginx)
@@ -13,6 +13,15 @@
 #   4. Installs Node.js dependencies and builds the frontend
 #   5. Writes a systemd service file so the backend starts on boot
 #   6. Optionally configures nginx as a reverse proxy
+#
+# Options:
+#   --dev           Development mode: skips nginx and does not start the service.
+#   --build-gphoto2 Build libgphoto2 and gphoto2 from the latest upstream source
+#                   instead of using the distro package.  The distro package is
+#                   often compiled without ltdl (dynamic plugin loading), which
+#                   limits camera driver support.  This option fixes that and
+#                   ensures the newest camera drivers are available.  Adds
+#                   20–40 minutes to the install time on a Raspberry Pi.
 # =============================================================================
 
 set -euo pipefail
@@ -28,10 +37,107 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEV_MODE=false
+BUILD_GPHOTO2=false
 
 for arg in "$@"; do
-  [[ "$arg" == "--dev" ]] && DEV_MODE=true
+  case "$arg" in
+    --dev)           DEV_MODE=true ;;
+    --build-gphoto2) BUILD_GPHOTO2=true ;;
+  esac
 done
+
+# ---------------------------------------------------------------------------
+# Build gphoto2 + libgphoto2 from upstream source
+#
+# The distro packages are often many releases behind and may be compiled
+# without optional camera drivers.  Pass --build-gphoto2 to get the latest
+# upstream version with full driver support.
+# ---------------------------------------------------------------------------
+build_gphoto2_from_source() {
+    info "Building libgphoto2 and gphoto2 from upstream source…"
+    info "This may take 20–40 minutes on a Raspberry Pi – please be patient."
+
+    # Build-time dependencies
+    info "Installing gphoto2 build dependencies…"
+    sudo apt-get install -y -qq \
+        build-essential \
+        autoconf \
+        automake \
+        libtool \
+        pkg-config \
+        libusb-1.0-0-dev \
+        libexif-dev \
+        libpopt-dev \
+        libltdl-dev \
+        gettext
+
+    local WORK
+    WORK=$(mktemp -d /tmp/gphoto2-src-XXXXXX)
+
+    # _build_one GITHUB_REPO LOCAL_NAME
+    #   Downloads the latest release tarball, builds, and installs to /usr/local.
+    _build_one() {
+        local repo="$1" name="$2"
+
+        info "Fetching latest ${name} release info from GitHub…"
+        local api_response tag
+        api_response=$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest") \
+            || error "Failed to reach GitHub API for ${repo} – check network connectivity."
+        tag=$(printf '%s' "$api_response" \
+              | grep -m1 '"tag_name"' \
+              | sed 's/.*"tag_name" *: *"\([^"]*\)".*/\1/')
+        [[ -z "$tag" ]] && error "Could not determine latest ${name} release tag (API response may be malformed or rate-limited)."
+
+        local ver="${tag#v}"   # strip any leading 'v'
+        local tarball="${name}-${ver}.tar.bz2"
+        local url="https://github.com/${repo}/releases/download/${tag}/${tarball}"
+
+        info "Downloading ${name} ${ver}…"
+        curl -fsSL "$url" -o "${WORK}/${tarball}" \
+            || error "Failed to download ${name} ${ver} from ${url}."
+
+        info "Extracting ${tarball}…"
+        tar -xjf "${WORK}/${tarball}" -C "$WORK" \
+            || error "Failed to extract ${tarball}."
+
+        local src_dir="${WORK}/${name}-${ver}"
+        [[ -d "$src_dir" ]] || error "Expected source directory ${src_dir} not found after extraction."
+
+        info "Configuring ${name} ${ver}…"
+        pushd "$src_dir" > /dev/null
+        # autoreconf regenerates the build system; harmless if already up-to-date.
+        # Export PKG_CONFIG_PATH before configure AND make so every build step
+        # can locate the freshly-installed libgphoto2 pkg-config files.
+        export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        if ! autoreconf --install 2>/dev/null; then
+            warn "autoreconf returned non-zero for ${name} – attempting ./configure anyway."
+        fi
+        ./configure --prefix=/usr/local --disable-rpath \
+            || error "${name} ./configure failed."
+
+        info "Compiling ${name} ${ver} ($(nproc) thread(s))…"
+        make -j"$(nproc)" || error "${name} make failed."
+
+        info "Installing ${name} ${ver}…"
+        sudo make install || error "${name} make install failed."
+        popd > /dev/null
+
+        info "${name} ${ver} installed to /usr/local."
+    }
+
+    _build_one "gphoto/libgphoto2" "libgphoto2"
+    # Refresh the dynamic-linker cache so the new libgphoto2 is found at
+    # link time when building the gphoto2 CLI below.
+    sudo ldconfig
+
+    _build_one "gphoto/gphoto2" "gphoto2"
+
+    rm -rf "$WORK"
+
+    local built_ver
+    built_ver=$(gphoto2 --version 2>&1 | head -1 || true)
+    info "gphoto2 from source ready: ${built_ver}"
+}
 
 # ---------------------------------------------------------------------------
 # 1. System packages
@@ -41,17 +147,35 @@ sudo apt-get update -qq
 
 info "Installing system dependencies…"
 sudo apt-get install -y -qq \
-    gphoto2 \
     python3 \
     python3-pip \
     python3-venv \
-    libgphoto2-dev \
     libturbojpeg0 \
     libjpeg-dev \
     zlib1g-dev \
     libopenblas0 \
     git \
     curl
+
+if $BUILD_GPHOTO2; then
+    build_gphoto2_from_source
+else
+    info "Installing gphoto2 from distro packages…"
+    sudo apt-get install -y -qq \
+        gphoto2 \
+        libgphoto2-dev
+    # The Debian/Raspbian package is compiled without ltdl (libtool dynamic
+    # loading), which prevents libgphoto2 from loading camera-specific driver
+    # plugins at runtime.  Warn the user so they know why to use --build-gphoto2
+    # if they hit camera-compatibility problems.
+    # Match "no ltdl" only on the libgphoto2 version line to avoid false positives.
+    if gphoto2 --version 2>&1 | grep -q '^libgphoto2 .*\bno ltdl\b'; then
+        warn "The installed libgphoto2 was compiled WITHOUT ltdl (dynamic plugin loading)."
+        warn "Camera-specific driver plugins cannot be loaded at runtime."
+        warn "If you experience capture errors or limited camera support, rebuild from source:"
+        warn "  ./install.sh --build-gphoto2"
+    fi
+fi
 
 # Node.js (v20 LTS)
 if ! command -v node &>/dev/null; then
@@ -237,4 +361,6 @@ else
     echo "  Enable debug logging:"
     echo "    sudo sed -i 's/^LOG_LEVEL=.*/LOG_LEVEL=debug/' ${ENV_FILE}"
     echo "    sudo systemctl restart gphoto2-astro-webui"
+    echo "  Rebuild gphoto2 from source (enables ltdl dynamic plugins, latest drivers):"
+    echo "    ./install.sh --build-gphoto2"
 fi
