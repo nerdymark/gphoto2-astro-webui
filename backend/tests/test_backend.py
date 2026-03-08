@@ -451,6 +451,83 @@ class TestCameraModule:
 
         assert any("no file was downloaded" in r.message for r in caplog.records)
 
+    def test_capture_image_ptp_access_denied_raises_with_detail(self, tmp_path):
+        """gphoto2 exits 0 with 'PTP Access Denied' in stderr: RuntimeError with that detail.
+
+        gphoto2 can return exit code 0 while writing a PTP error to stderr when
+        the camera is in a state that blocks software-triggered captures.  The
+        error must be surfaced to the caller instead of the generic fallback.
+        """
+        import camera as cam
+
+        ptp_stderr = (
+            "*** Error ***              \n"
+            "PTP Access Denied\n"
+            "ERROR: Could not capture image.\n"
+            "ERROR: Could not capture."
+        )
+
+        def mock_run(args, check=True, cwd=None):
+            if "--capture-image-and-download" in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout="", stderr=ptp_stderr
+                )
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+        ):
+            with pytest.raises(RuntimeError, match="PTP Access Denied"):
+                cam.capture_image(tmp_path)
+
+    def test_capture_image_ptp_access_denied_logs_error(self, tmp_path, caplog):
+        """PTP Access Denied (exit 0) must be logged at ERROR level."""
+        import camera as cam
+
+        ptp_stderr = (
+            "*** Error ***\nPTP Access Denied\nERROR: Could not capture image."
+        )
+
+        def mock_run(args, check=True, cwd=None):
+            if "--capture-image-and-download" in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout="", stderr=ptp_stderr
+                )
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+            caplog.at_level(logging.ERROR, logger="camera"),
+        ):
+            with pytest.raises(RuntimeError):
+                cam.capture_image(tmp_path)
+
+        assert any("PTP Access Denied" in r.message for r in caplog.records)
+
+    def test_capture_image_could_not_capture_stderr_raises(self, tmp_path):
+        """'ERROR: Could not capture' in stderr with exit 0 raises RuntimeError."""
+        import camera as cam
+
+        def mock_run(args, check=True, cwd=None):
+            if "--capture-image-and-download" in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout="",
+                    stderr="ERROR: Could not capture image.\nERROR: Could not capture.",
+                )
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+        ):
+            with pytest.raises(RuntimeError, match="Could not capture"):
+                cam.capture_image(tmp_path)
+
     def test_get_config_not_found_logs_warning_not_error(self, caplog):
         """'not found in configuration tree' should be a WARNING, not an ERROR.
 
