@@ -348,11 +348,27 @@ def capture_image(gallery_path: Path) -> Path:
                 ],
                 cwd=tmpdir,
             )
+            stderr_stripped = (result.stderr or "").strip()
             logger.debug(
                 "capture_image: gphoto2 stdout=%r stderr=%r",
                 (result.stdout or "").strip(),
-                (result.stderr or "").strip(),
+                stderr_stripped,
             )
+            # gphoto2 sometimes exits with code 0 while printing a capture
+            # error to stderr (e.g. "PTP Access Denied" when the camera is in
+            # a state that blocks software-triggered captures).  Detect these
+            # patterns early so callers receive the real error rather than the
+            # generic "no file was downloaded" fallback.
+            if stderr_stripped and (
+                "PTP Access Denied" in stderr_stripped
+                or "ERROR: Could not capture" in stderr_stripped
+            ):
+                logger.error(
+                    "capture_image: gphoto2 exited 0 but reported a capture"
+                    " error – stderr=%r",
+                    stderr_stripped,
+                )
+                raise RuntimeError(f"Capture failed: {stderr_stripped}")
             captured = list(Path(tmpdir).iterdir())
             logger.debug("capture_image: files in tmpdir after capture: %s", captured)
             if not captured:
@@ -360,9 +376,13 @@ def capture_image(gallery_path: Path) -> Path:
                     "capture_image: gphoto2 exited successfully but no file was downloaded"
                     " – stdout=%r stderr=%r",
                     (result.stdout or "").strip(),
-                    (result.stderr or "").strip(),
+                    stderr_stripped,
                 )
-                raise RuntimeError("gphoto2 captured nothing")
+                raise RuntimeError(
+                    f"Capture failed: {stderr_stripped}"
+                    if stderr_stripped
+                    else "gphoto2 captured nothing"
+                )
             src = captured[0]
             dst = gallery_path / src.name
             shutil.move(str(src), str(dst))
