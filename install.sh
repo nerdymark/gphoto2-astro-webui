@@ -88,16 +88,21 @@ if ! $DEV_MODE; then
 fi
 
 # ---------------------------------------------------------------------------
-# Disable gvfs-gphoto2-volume-monitor
-# The GNOME Virtual File System daemon auto-mounts cameras over MTP/PTP and
-# can hold the USB interface, preventing gphoto2 from accessing the device
-# (error -53: 'Could not claim the USB device').  Mask and stop it now so
-# the camera is available to this service on every boot.
+# Disable GNOME VFS camera daemons
+# Two cooperating GNOME VFS processes auto-mount cameras over MTP/PTP and can
+# hold the USB interface, preventing gphoto2 from accessing the device (error
+# -53: 'Could not claim the USB device'):
+#   gvfs-gphoto2-volume-monitor – detects newly attached cameras
+#   gvfsd-gphoto2               – the worker that actually claims the USB interface
+# Mask the volume monitor so it no longer auto-starts, and kill both processes
+# now so the camera is immediately available.  No sudo is required because both
+# processes run as the current user (${USER}).
 # ---------------------------------------------------------------------------
-info "Masking gvfs-gphoto2-volume-monitor to prevent USB device conflicts…"
+info "Masking gvfs-gphoto2-volume-monitor and stopping GNOME VFS camera daemons…"
 systemctl --user mask gvfs-gphoto2-volume-monitor 2>/dev/null \
     && systemctl --user stop gvfs-gphoto2-volume-monitor 2>/dev/null \
     || warn "Could not mask gvfs-gphoto2-volume-monitor (may not be installed – this is fine)"
+pkill -f gvfsd-gphoto2 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 2. Python virtual environment
@@ -141,6 +146,7 @@ User=${USER}
 WorkingDirectory=${REPO_DIR}/backend
 Environment="GALLERY_ROOT=${REPO_DIR}/galleries"
 ExecStartPre=-/usr/bin/pkill -f gvfs-gphoto2-volume-monitor
+ExecStartPre=-/usr/bin/pkill -f gvfsd-gphoto2
 ExecStart=${REPO_DIR}/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5

@@ -155,6 +155,37 @@ class TestCameraModule:
         ):
             cam._kill_gvfs_monitor()  # must not raise
 
+    def test_kill_gvfs_monitor_kills_gvfsd_gphoto2(self):
+        """_kill_gvfs_monitor must also kill gvfsd-gphoto2, which holds the USB interface."""
+        import camera as cam
+
+        with (
+            patch("camera.subprocess.run") as mock_run,
+            patch("camera.time.sleep"),
+        ):
+            cam._kill_gvfs_monitor()
+
+        # Collect all commands that were attempted
+        called_cmds = [call.args[0] for call in mock_run.call_args_list]
+        command_strings = [" ".join(cmd) for cmd in called_cmds]
+        assert any("gvfsd-gphoto2" in c for c in command_strings), (
+            "gvfsd-gphoto2 was not targeted; it holds the USB interface and must be stopped"
+        )
+
+    def test_kill_gvfs_monitor_warning_mentions_gvfsd(self, caplog):
+        """The warning log should mention gvfsd-gphoto2 so operators know what was stopped."""
+        import camera as cam
+
+        with (
+            patch("camera.subprocess.run"),
+            patch("camera.time.sleep"),
+            caplog.at_level(logging.WARNING, logger="camera"),
+        ):
+            cam._kill_gvfs_monitor()
+
+        log_messages = " ".join(r.message for r in caplog.records)
+        assert "gvfsd-gphoto2" in log_messages
+
 
 # ---------------------------------------------------------------------------
 # stacking module tests
