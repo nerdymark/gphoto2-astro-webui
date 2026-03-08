@@ -31,7 +31,12 @@ import camera as cam
 import stacking as stk
 
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, _LOG_LEVEL, logging.INFO))
+_level = getattr(logging, _LOG_LEVEL, logging.INFO)
+# basicConfig configures the root logger when no handlers exist yet (standalone run).
+# root.setLevel ensures the level is always applied even when uvicorn has already
+# configured the root logger's handlers before this module is imported.
+logging.basicConfig(level=_level)
+logging.root.setLevel(_level)
 logger = logging.getLogger(__name__)
 if not hasattr(logging, _LOG_LEVEL):
     logger.warning("Unknown LOG_LEVEL %r; defaulting to INFO", _LOG_LEVEL)

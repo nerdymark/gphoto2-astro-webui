@@ -132,10 +132,29 @@ cd "${REPO_DIR}"
 # 4. Systemd service
 # ---------------------------------------------------------------------------
 SERVICE_FILE="/etc/systemd/system/gphoto2-astro-webui.service"
+ENV_FILE="/etc/gphoto2-astro-webui.env"
 
-if [[ ! -f "$SERVICE_FILE" ]]; then
-    info "Installing systemd service…"
-    sudo tee "$SERVICE_FILE" > /dev/null << EOF
+# Create the user-editable environment file only on first install so that
+# any manual changes (e.g. LOG_LEVEL=debug) are preserved on re-runs.
+if [[ ! -f "$ENV_FILE" ]]; then
+    info "Creating environment configuration file ${ENV_FILE}…"
+    sudo tee "$ENV_FILE" > /dev/null << 'EOF'
+# gphoto2-astro-webui environment configuration
+# Edit this file to customise the service, then restart:
+#   sudo systemctl restart gphoto2-astro-webui
+
+# Log level for the application and uvicorn (debug, info, warning, error, critical).
+# Change to "debug" for verbose logging.
+LOG_LEVEL=info
+EOF
+else
+    info "Environment file ${ENV_FILE} already exists – preserving."
+fi
+
+# Always write (or update) the service file so that new directives such as
+# EnvironmentFile are picked up on re-runs without requiring a manual edit.
+info "Writing systemd service file…"
+sudo tee "$SERVICE_FILE" > /dev/null << EOF
 [Unit]
 Description=gphoto2 Astro WebUI backend
 After=network.target
@@ -145,10 +164,11 @@ Type=simple
 User=${USER}
 WorkingDirectory=${REPO_DIR}/backend
 Environment="GALLERY_ROOT=${REPO_DIR}/galleries"
-# LOG_LEVEL controls both Python application logging and uvicorn's own logging.
-# Use lowercase values (debug, info, warning, error, critical) for uvicorn compatibility.
-# To enable debug logging: change the value below to "debug" and restart the service.
+# Default log level; overridden by LOG_LEVEL in the environment file below.
 Environment="LOG_LEVEL=info"
+# User-configurable overrides (e.g. LOG_LEVEL=debug).
+# Edit ${ENV_FILE} and restart the service to apply changes.
+EnvironmentFile=-${ENV_FILE}
 ExecStartPre=-/usr/bin/pkill -f gvfs-gphoto2-volume-monitor
 ExecStartPre=-/usr/bin/pkill -f gvfsd-gphoto2
 ExecStart=${REPO_DIR}/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level \${LOG_LEVEL}
@@ -159,12 +179,9 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable gphoto2-astro-webui.service
-    info "Service installed and enabled."
-else
-    warn "Systemd service file already exists – skipping."
-fi
+sudo systemctl daemon-reload
+sudo systemctl enable gphoto2-astro-webui.service
+info "Service file written and daemon reloaded."
 
 # ---------------------------------------------------------------------------
 # 5. Nginx reverse proxy (production only)
@@ -217,4 +234,7 @@ else
     echo "  Open http://${IP} in your browser"
     echo "  Service status:  sudo systemctl status gphoto2-astro-webui"
     echo "  View logs:       journalctl -u gphoto2-astro-webui -f"
+    echo "  Enable debug logging:"
+    echo "    sudo sed -i 's/^LOG_LEVEL=.*/LOG_LEVEL=debug/' ${ENV_FILE}"
+    echo "    sudo systemctl restart gphoto2-astro-webui"
 fi
