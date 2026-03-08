@@ -277,13 +277,14 @@ class TestCameraModule:
         assert choices == ["100", "200", "400", "800"]
 
     def test_get_config_error_returns_none_and_empty(self, caplog):
-        """_get_config returns (None, []) and logs an error when gphoto2 fails."""
+        """_get_config returns (None, []) and logs an error when gphoto2 fails
+        with a non-'not found' error (e.g. a USB communication failure)."""
         import camera as cam
 
         fake_exc = subprocess.CalledProcessError(
             returncode=1,
-            cmd=["/usr/bin/gphoto2", "--get-config", "aperture"],
-            stderr="aperture not found in configuration tree.",
+            cmd=["/usr/bin/gphoto2", "--get-config", "iso"],
+            stderr="*** Error (-53: 'Could not claim the USB device') ***",
             output="",
         )
         with (
@@ -291,11 +292,11 @@ class TestCameraModule:
             patch.object(cam, "_run", side_effect=fake_exc),
             caplog.at_level(logging.ERROR, logger="camera"),
         ):
-            value, choices = cam._get_config("aperture")
+            value, choices = cam._get_config("iso")
 
         assert value is None
         assert choices == []
-        assert any("aperture" in r.message for r in caplog.records)
+        assert any("iso" in r.message for r in caplog.records)
 
     def test_get_exposure_settings_falls_back_to_f_number(self):
         """get_exposure_settings uses f-number when aperture is not found."""
@@ -422,6 +423,103 @@ class TestCameraModule:
                 cam.capture_image(tmp_path)
 
         assert any("no file was downloaded" in r.message for r in caplog.records)
+
+    def test_get_config_not_found_logs_warning_not_error(self, caplog):
+        """'not found in configuration tree' should be a WARNING, not an ERROR.
+
+        Cameras with manual lenses routinely lack the 'aperture' config key;
+        flooding the log with ERROR-level messages would be misleading.
+        """
+        import camera as cam
+
+        fake_exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["/usr/bin/gphoto2", "--get-config", "aperture"],
+            stderr="*** Error ***\naperture not found in configuration tree.\n*** Error (-1: 'Unspecified error') ***",
+            output="",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", side_effect=fake_exc),
+            caplog.at_level(logging.WARNING, logger="camera"),
+        ):
+            value, choices = cam._get_config("aperture")
+
+        assert value is None
+        assert choices == []
+        # Must be logged at WARNING, not ERROR
+        aperture_records = [r for r in caplog.records if "aperture" in r.message]
+        assert aperture_records, "Expected at least one log record mentioning 'aperture'"
+        assert all(r.levelno < logging.ERROR for r in aperture_records), (
+            "Expected WARNING (not ERROR) for 'not found in configuration tree'"
+        )
+
+    def test_capture_image_sets_capturetarget_before_download(self, tmp_path):
+        """capture_image must set capturetarget=0 before --capture-image-and-download
+        so images are downloaded to the host rather than saved only to the camera card."""
+        import camera as cam
+
+        call_log: list[list[str]] = []
+
+        def mock_run(args, check=True, cwd=None):
+            call_log.append(list(args))
+            if "--capture-image-and-download" in args and cwd:
+                (Path(cwd) / "20240308-173422-00001.JPG").write_bytes(b"\xff\xd8fake")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+        ):
+            cam.capture_image(tmp_path)
+
+        # capturetarget=0 must appear in an argument list before the capture call
+        capturetarget_indices = [
+            i for i, args in enumerate(call_log)
+            if any("capturetarget=0" in a for a in args)
+        ]
+        capture_indices = [
+            i for i, args in enumerate(call_log)
+            if "--capture-image-and-download" in args
+        ]
+        assert capturetarget_indices, "capturetarget=0 was never set before capture"
+        assert capture_indices, "--capture-image-and-download was not called"
+        assert min(capturetarget_indices) < min(capture_indices), (
+            "capturetarget=0 must be set BEFORE --capture-image-and-download"
+        )
+
+    def test_capture_image_proceeds_when_capturetarget_unsupported(self, tmp_path, caplog):
+        """capture_image must still succeed when capturetarget is not supported.
+
+        Some cameras do not expose a capturetarget config key; the failure must
+        be logged as a WARNING and capture must continue.
+        """
+        import camera as cam
+
+        def mock_run(args, check=True, cwd=None):
+            if any("capturetarget=0" in a for a in args):
+                return subprocess.CompletedProcess(
+                    args=args, returncode=1,
+                    stdout="", stderr="capturetarget not found in configuration tree.",
+                )
+            if "--capture-image-and-download" in args and cwd:
+                (Path(cwd) / "20240308-173422-00001.JPG").write_bytes(b"\xff\xd8fake")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+            caplog.at_level(logging.WARNING, logger="camera"),
+        ):
+            result = cam.capture_image(tmp_path)
+
+        assert result.exists(), "capture_image must return a valid file path"
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("capturetarget" in m for m in warning_messages), (
+            "Expected a WARNING about capturetarget not being set"
+        )
 
 
 # ---------------------------------------------------------------------------

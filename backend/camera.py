@@ -205,12 +205,16 @@ def _get_config(key: str) -> tuple[Optional[str], list[str]]:
                     choices.append(parts[2])
         return value, choices
     except subprocess.CalledProcessError as exc:
-        logger.error(
-            "_get_config(%r) failed (exit %d): %s",
-            key,
-            exc.returncode,
-            (exc.stderr or "").strip() or (exc.stdout or "").strip(),
-        )
+        msg = (exc.stderr or "").strip() or (exc.stdout or "").strip()
+        if "not found in configuration tree" in msg:
+            logger.warning("_get_config(%r): key not supported by this camera", key)
+        else:
+            logger.error(
+                "_get_config(%r) failed (exit %d): %s",
+                key,
+                exc.returncode,
+                msg,
+            )
     except Exception as exc:
         logger.error("_get_config(%r) unexpected error: %s", key, exc)
     return None, []
@@ -285,6 +289,16 @@ def capture_image(gallery_path: Path) -> Path:
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
+            # Ensure the image is downloaded to the host rather than saved only
+            # to the camera's memory card.  capturetarget=0 means "Internal RAM"
+            # on most cameras; if the key is not supported the warning is logged
+            # and capture proceeds unchanged.
+            ct = _run(["--set-config", "capturetarget=0"], check=False)
+            if ct.returncode != 0:
+                logger.warning(
+                    "capture_image: could not set capturetarget=0: %s",
+                    (ct.stderr or "").strip(),
+                )
             _run(
                 [
                     "--capture-image-and-download",
