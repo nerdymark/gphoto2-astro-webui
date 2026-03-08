@@ -35,6 +35,9 @@ def _kill_gvfs_monitor() -> None:
     Killing only the volume monitor leaves gvfsd-gphoto2 running with the interface
     still claimed.  Both must be stopped so gphoto2 can acquire the device and avoid
     error -53 ('Could not claim the USB device').
+
+    sudo is not required: both daemons run as the same user that owns this process,
+    so an unprivileged pkill is sufficient to terminate them.
     """
     logger.warning(
         "USB device is claimed by another process; "

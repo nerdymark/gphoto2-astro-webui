@@ -155,6 +155,6 @@ pytest tests/ -v
 | Problem | Fix |
 |---|---|
 | "No camera" shown | Check USB cable; run `gphoto2 --auto-detect` |
-| Camera busy/locked | Stop the GVFS gphoto2 volume monitor daemon |
+| Camera busy/locked | The app handles this automatically; for manual recovery run `pkill -f gvfsd-gphoto2` |
 | Permission denied on USB | `sudo adduser $USER plugdev` then re-login |
 | Port 8000 in use | Change `--port` in the systemd service unit |
