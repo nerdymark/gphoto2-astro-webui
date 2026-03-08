@@ -276,6 +276,33 @@ class TestCameraModule:
         assert value == "800"
         assert choices == ["100", "200", "400", "800"]
 
+    def test_get_config_success_logs_debug(self, caplog):
+        """_get_config must log the parsed value and choices at DEBUG level on success."""
+        import camera as cam
+
+        output = (
+            "Label: ISO Speed\nType: RADIO\n"
+            "Current: 800\n"
+            "Choice: 0 100\nChoice: 1 200\nChoice: 2 400\nChoice: 3 800\n"
+        )
+        ok_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout=output, stderr=""
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", return_value=ok_result),
+            caplog.at_level(logging.DEBUG, logger="camera"),
+        ):
+            cam._get_config("iso")
+
+        debug_messages = [r.message for r in caplog.records if r.levelno == logging.DEBUG]
+        assert any("iso" in m for m in debug_messages), (
+            "Expected a DEBUG log from _get_config containing the key name"
+        )
+        assert any("800" in m for m in debug_messages), (
+            "Expected a DEBUG log from _get_config containing the parsed value"
+        )
+
     def test_get_config_error_returns_none_and_empty(self, caplog):
         """_get_config returns (None, []) and logs an error when gphoto2 fails
         with a non-'not found' error (e.g. a USB communication failure)."""

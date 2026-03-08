@@ -210,6 +210,7 @@ def _get_config(key: str) -> tuple[Optional[str], list[str]]:
                 parts = stripped.split(None, 2)
                 if len(parts) == 3:
                     choices.append(parts[2])
+        logger.debug("_get_config(%r): value=%r choices=%r", key, value, choices)
         return value, choices
     except subprocess.CalledProcessError as exc:
         msg = (exc.stderr or "").strip() or (exc.stdout or "").strip()
