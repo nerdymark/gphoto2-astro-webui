@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Optional
@@ -21,6 +22,16 @@ GPHOTO2_BIN = shutil.which("gphoto2")
 
 # Substring present in gphoto2 stderr when the OS has claimed the USB device.
 USB_CLAIM_ERROR = "Could not claim the USB device"
+
+# Maximum number of attempts when a USB claim error is encountered.
+_USB_MAX_ATTEMPTS = 3
+
+# Serialise all gphoto2 calls so that concurrent HTTP requests cannot race to
+# claim the camera's USB interface.  RLock is used because some public
+# functions call _run() more than once in the same thread (e.g.
+# get_camera_summary calls is_camera_connected, which calls _run, and then
+# calls _run again for --summary).
+_camera_lock = threading.RLock()
 
 
 def _kill_gvfs_monitor() -> None:
@@ -53,16 +64,17 @@ def _kill_gvfs_monitor() -> None:
         except (FileNotFoundError, subprocess.SubprocessError):
             pass
     # Give the kernel time to release the USB interface.
-    time.sleep(2)
+    time.sleep(3)
 
 
 def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     cmd = [GPHOTO2_BIN] + args
-    for attempt in range(2):
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
-        if USB_CLAIM_ERROR not in (result.stderr or "") or attempt > 0:
-            break
-        _kill_gvfs_monitor()
+    with _camera_lock:
+        for attempt in range(_USB_MAX_ATTEMPTS):
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+            if USB_CLAIM_ERROR not in (result.stderr or "") or attempt >= _USB_MAX_ATTEMPTS - 1:
+                break
+            _kill_gvfs_monitor()
     if check and result.returncode != 0:
         raise subprocess.CalledProcessError(
             result.returncode, cmd, output=result.stdout, stderr=result.stderr
