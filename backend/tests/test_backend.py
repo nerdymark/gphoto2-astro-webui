@@ -186,6 +186,57 @@ class TestCameraModule:
         log_messages = " ".join(r.message for r in caplog.records)
         assert "gvfsd-gphoto2" in log_messages
 
+    def test_run_gives_up_after_max_usb_retries(self):
+        """After _USB_MAX_ATTEMPTS failed attempts, _run stops retrying and raises."""
+        import camera as cam
+
+        usb_error = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="",
+            stderr="Could not claim the USB device",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch("camera.subprocess.run", return_value=usb_error) as mock_run,
+            patch.object(cam, "_kill_gvfs_monitor") as mock_kill,
+        ):
+            with pytest.raises(subprocess.CalledProcessError):
+                cam._run(["--summary"])
+
+        # With _USB_MAX_ATTEMPTS=3: runs 3 times, kills after attempts 0 and 1
+        assert mock_run.call_count == cam._USB_MAX_ATTEMPTS
+        assert mock_kill.call_count == cam._USB_MAX_ATTEMPTS - 1
+
+    def test_run_serializes_concurrent_calls(self):
+        """Concurrent _run calls must be serialized so only one gphoto2 runs at a time."""
+        import camera as cam
+        import threading as thr
+
+        active_count = [0]
+        max_concurrent = [0]
+        counter_lock = thr.Lock()
+
+        def tracked_run(cmd, **kwargs):
+            with counter_lock:
+                active_count[0] += 1
+                max_concurrent[0] = max(max_concurrent[0], active_count[0])
+            time.sleep(0.01)
+            with counter_lock:
+                active_count[0] -= 1
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="OK", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch("camera.subprocess.run", side_effect=tracked_run),
+        ):
+            threads = [thr.Thread(target=cam._run, args=(["--summary"],)) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        # The lock ensures gphoto2 is never called concurrently
+        assert max_concurrent[0] == 1
+
 
 # ---------------------------------------------------------------------------
 # stacking module tests
