@@ -11,7 +11,6 @@ import logging
 from pathlib import Path
 from typing import Literal
 
-import numpy as np
 from PIL import Image
 
 logger = logging.getLogger(__name__)
@@ -34,9 +33,20 @@ def stack_images(
         A single PIL Image representing the stacked result.
 
     Raises:
+        ImportError: When NumPy is not available (required for stacking).
         ValueError: When fewer than 2 images are provided or the mode is unknown.
         RuntimeError: When image sizes are inconsistent.
     """
+    try:
+        import numpy as np
+    except ImportError as exc:
+        raise ImportError(
+            "NumPy is required for image stacking but could not be imported. "
+            "Ensure it is installed (`pip install numpy`) and that its system "
+            "dependencies (e.g. libopenblas0 on Debian/Ubuntu/Raspberry Pi OS) "
+            "are present. See the project README for installation instructions."
+        ) from exc
+
     if len(image_paths) < 2:
         raise ValueError("At least 2 images are required for stacking")
     if mode not in ("mean", "median", "sum"):

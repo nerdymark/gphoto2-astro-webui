@@ -49,6 +49,7 @@ sudo apt-get install -y -qq \
     libturbojpeg0 \
     libjpeg-dev \
     zlib1g-dev \
+    libopenblas0 \
     git \
     curl
 
