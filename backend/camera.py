@@ -24,26 +24,33 @@ USB_CLAIM_ERROR = "Could not claim the USB device"
 
 
 def _kill_gvfs_monitor() -> None:
-    """Stop gvfs-gphoto2-volume-monitor, which can hold the camera's USB interface.
+    """Stop GNOME VFS processes that hold the camera's USB interface.
 
-    The GNOME Virtual File System daemon automatically mounts cameras over MTP/PTP.
-    When it holds the interface gphoto2 gets error -53 ('Could not claim the USB
-    device').  Stopping the daemon releases the interface so gphoto2 can proceed.
+    The GNOME Virtual File System uses two cooperating processes for camera access:
+    * gvfs-gphoto2-volume-monitor – detects newly attached cameras and triggers
+      mounting.
+    * gvfsd-gphoto2 – the worker daemon that actually claims the USB interface and
+      provides filesystem access to the camera.
+
+    Killing only the volume monitor leaves gvfsd-gphoto2 running with the interface
+    still claimed.  Both must be stopped so gphoto2 can acquire the device and avoid
+    error -53 ('Could not claim the USB device').
     """
     logger.warning(
         "USB device is claimed by another process; "
-        "attempting to stop gvfs-gphoto2-volume-monitor…"
+        "attempting to stop gvfs-gphoto2-volume-monitor and gvfsd-gphoto2…"
     )
     for cmd in (
         ["systemctl", "--user", "stop", "gvfs-gphoto2-volume-monitor"],
         ["pkill", "-f", "gvfs-gphoto2-volume-monitor"],
+        ["pkill", "-f", "gvfsd-gphoto2"],
     ):
         try:
             subprocess.run(cmd, capture_output=True, timeout=5)
         except (FileNotFoundError, subprocess.SubprocessError):
             pass
-    # Give the kernel a moment to release the USB interface.
-    time.sleep(1)
+    # Give the kernel time to release the USB interface.
+    time.sleep(2)
 
 
 def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
