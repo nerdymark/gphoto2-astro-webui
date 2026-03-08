@@ -43,9 +43,10 @@ done
 # ---------------------------------------------------------------------------
 # Build gphoto2 + libgphoto2 from upstream source
 #
-# The distro packages are often many releases behind and may be compiled
-# without optional camera drivers.  Pass --build-gphoto2 to get the latest
-# upstream version with full driver support.
+# Distro packages are often many releases behind and are compiled without
+# ltdl (dynamic plugin loading), which limits camera driver support.
+# Building from source guarantees the latest upstream version with full
+# driver support.  Installed to /usr/local.
 # ---------------------------------------------------------------------------
 build_gphoto2_from_source() {
     info "Building libgphoto2 and gphoto2 from upstream source…"
@@ -156,9 +157,24 @@ sudo apt-get install -y -qq \
 # locally built version.
 # ---------------------------------------------------------------------------
 info "Removing any distro-packaged gphoto2/libgphoto2 (if installed)…"
-sudo apt-get remove -y -qq gphoto2 libgphoto2-dev libgphoto2-6 2>/dev/null || true
+sudo apt-get remove -y -qq gphoto2 libgphoto2-dev libgphoto2-6 2>&1 || true
 
 build_gphoto2_from_source
+
+# Register the locally built binary with update-alternatives so that
+# /usr/bin/gphoto2 always points to the local build regardless of PATH order.
+# This prevents the systemd service (or any other process) from accidentally
+# picking up a distro-packaged binary that may be installed later.
+info "Registering locally built gphoto2 with update-alternatives…"
+# Priority 100 is intentionally higher than the Debian/Raspbian package default
+# (50), so the locally built binary remains the active alternative even if the
+# distro package is ever reinstalled.
+sudo update-alternatives --install /usr/bin/gphoto2 gphoto2 /usr/local/bin/gphoto2 100
+sudo update-alternatives --set gphoto2 /usr/local/bin/gphoto2
+
+# Refresh the dynamic-linker cache so the locally built libgphoto2 is found
+# by anything that links against it (including the gphoto2 CLI registered above).
+sudo ldconfig
 
 # ---------------------------------------------------------------------------
 # udev rule: prevent gvfs from auto-mounting cameras controlled by gphoto2
@@ -339,6 +355,7 @@ After=network.target
 Type=simple
 User=${USER}
 WorkingDirectory=${REPO_DIR}/backend
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="GALLERY_ROOT=${REPO_DIR}/galleries"
 # Default log level; overridden by LOG_LEVEL in the environment file below.
 Environment="LOG_LEVEL=info"
