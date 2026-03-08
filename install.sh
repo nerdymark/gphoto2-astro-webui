@@ -4,24 +4,20 @@
 #
 # Usage:
 #   chmod +x install.sh
-#   ./install.sh [--dev] [--build-gphoto2]
+#   ./install.sh [--dev]
 #
 # What it does:
-#   1. Installs system dependencies (gphoto2, python3-venv, Node.js, nginx)
-#   2. Creates a Python virtual environment in ./backend/.venv
-#   3. Installs Python dependencies
-#   4. Installs Node.js dependencies and builds the frontend
-#   5. Writes a systemd service file so the backend starts on boot
-#   6. Optionally configures nginx as a reverse proxy
+#   1. Removes any distro-packaged gphoto2/libgphoto2 (apt) if present
+#   2. Builds libgphoto2 and gphoto2 from the latest upstream source
+#      (ensures full ltdl/dynamic plugin support and newest camera drivers)
+#   3. Creates a Python virtual environment in ./backend/.venv
+#   4. Installs Python dependencies
+#   5. Installs Node.js dependencies and builds the frontend
+#   6. Writes a systemd service file so the backend starts on boot
+#   7. Optionally configures nginx as a reverse proxy
 #
 # Options:
-#   --dev           Development mode: skips nginx and does not start the service.
-#   --build-gphoto2 Build libgphoto2 and gphoto2 from the latest upstream source
-#                   instead of using the distro package.  The distro package is
-#                   often compiled without ltdl (dynamic plugin loading), which
-#                   limits camera driver support.  This option fixes that and
-#                   ensures the newest camera drivers are available.  Adds
-#                   20–40 minutes to the install time on a Raspberry Pi.
+#   --dev  Development mode: skips nginx and does not start the service.
 # =============================================================================
 
 set -euo pipefail
@@ -37,12 +33,10 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEV_MODE=false
-BUILD_GPHOTO2=false
 
 for arg in "$@"; do
   case "$arg" in
-    --dev)           DEV_MODE=true ;;
-    --build-gphoto2) BUILD_GPHOTO2=true ;;
+    --dev) DEV_MODE=true ;;
   esac
 done
 
@@ -157,25 +151,14 @@ sudo apt-get install -y -qq \
     git \
     curl
 
-if $BUILD_GPHOTO2; then
-    build_gphoto2_from_source
-else
-    info "Installing gphoto2 from distro packages…"
-    sudo apt-get install -y -qq \
-        gphoto2 \
-        libgphoto2-dev
-    # The Debian/Raspbian package is compiled without ltdl (libtool dynamic
-    # loading), which prevents libgphoto2 from loading camera-specific driver
-    # plugins at runtime.  Warn the user so they know why to use --build-gphoto2
-    # if they hit camera-compatibility problems.
-    # Match "no ltdl" only on the libgphoto2 version line to avoid false positives.
-    if gphoto2 --version 2>&1 | grep -q '^libgphoto2 .*\bno ltdl\b'; then
-        warn "The installed libgphoto2 was compiled WITHOUT ltdl (dynamic plugin loading)."
-        warn "Camera-specific driver plugins cannot be loaded at runtime."
-        warn "If you experience capture errors or limited camera support, rebuild from source:"
-        warn "  ./install.sh --build-gphoto2"
-    fi
-fi
+# ---------------------------------------------------------------------------
+# Remove any distro-packaged gphoto2/libgphoto2 to avoid conflicts with the
+# locally built version.
+# ---------------------------------------------------------------------------
+info "Removing any distro-packaged gphoto2/libgphoto2 (if installed)…"
+sudo apt-get remove -y -qq gphoto2 libgphoto2-dev libgphoto2-6 2>/dev/null || true
+
+build_gphoto2_from_source
 
 # ---------------------------------------------------------------------------
 # udev rule: prevent gvfs from auto-mounting cameras controlled by gphoto2
@@ -432,6 +415,4 @@ else
     echo "  Enable debug logging:"
     echo "    sudo sed -i 's/^LOG_LEVEL=.*/LOG_LEVEL=debug/' ${ENV_FILE}"
     echo "    sudo systemctl restart gphoto2-astro-webui"
-    echo "  Rebuild gphoto2 from source (enables ltdl dynamic plugins, latest drivers):"
-    echo "    ./install.sh --build-gphoto2"
 fi
