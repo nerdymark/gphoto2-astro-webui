@@ -120,6 +120,41 @@ class TestCameraModule:
         assert result == []
         assert any("Could not claim the USB device" in r.message for r in caplog.records)
 
+    def test_run_retries_after_usb_claim_error(self, caplog):
+        """When gphoto2 returns a USB claim error, _run kills gvfs and retries."""
+        import camera as cam
+
+        usb_error = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="",
+            stderr="Could not claim the USB device",
+        )
+        ok_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Camera OK", stderr="",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch("camera.subprocess.run", side_effect=[usb_error, ok_result]) as mock_run,
+            patch.object(cam, "_kill_gvfs_monitor") as mock_kill,
+            patch("camera.time.sleep"),
+            caplog.at_level(logging.WARNING, logger="camera"),
+        ):
+            result = cam._run(["--summary"])
+
+        assert mock_kill.call_count == 1
+        assert mock_run.call_count == 2
+        assert result.returncode == 0
+        assert result.stdout == "Camera OK"
+
+    def test_kill_gvfs_monitor_swallows_errors(self):
+        """_kill_gvfs_monitor should not raise even if all sub-commands fail."""
+        import camera as cam
+
+        with (
+            patch("camera.subprocess.run", side_effect=FileNotFoundError("not found")),
+            patch("camera.time.sleep"),
+        ):
+            cam._kill_gvfs_monitor()  # must not raise
+
 
 # ---------------------------------------------------------------------------
 # stacking module tests

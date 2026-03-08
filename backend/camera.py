@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -18,10 +19,45 @@ logger = logging.getLogger(__name__)
 
 GPHOTO2_BIN = shutil.which("gphoto2")
 
+# Substring present in gphoto2 stderr when the OS has claimed the USB device.
+USB_CLAIM_ERROR = "Could not claim the USB device"
+
+
+def _kill_gvfs_monitor() -> None:
+    """Stop gvfs-gphoto2-volume-monitor, which can hold the camera's USB interface.
+
+    The GNOME Virtual File System daemon automatically mounts cameras over MTP/PTP.
+    When it holds the interface gphoto2 gets error -53 ('Could not claim the USB
+    device').  Stopping the daemon releases the interface so gphoto2 can proceed.
+    """
+    logger.warning(
+        "USB device is claimed by another process; "
+        "attempting to stop gvfs-gphoto2-volume-monitor…"
+    )
+    for cmd in (
+        ["systemctl", "--user", "stop", "gvfs-gphoto2-volume-monitor"],
+        ["pkill", "-f", "gvfs-gphoto2-volume-monitor"],
+    ):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=5)
+        except (FileNotFoundError, subprocess.SubprocessError):
+            pass
+    # Give the kernel a moment to release the USB interface.
+    time.sleep(1)
+
 
 def _run(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     cmd = [GPHOTO2_BIN] + args
-    return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=30)
+    for attempt in range(2):
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+        if USB_CLAIM_ERROR not in (result.stderr or "") or attempt > 0:
+            break
+        _kill_gvfs_monitor()
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd, output=result.stdout, stderr=result.stderr
+        )
+    return result
 
 
 def is_camera_connected() -> bool:
