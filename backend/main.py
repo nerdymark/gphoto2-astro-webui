@@ -30,8 +30,11 @@ from pydantic import BaseModel
 import camera as cam
 import stacking as stk
 
-logging.basicConfig(level=logging.INFO)
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, _LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
+if not hasattr(logging, _LOG_LEVEL):
+    logger.warning("Unknown LOG_LEVEL %r; defaulting to INFO", _LOG_LEVEL)
 
 # ---------------------------------------------------------------------------
 # Gallery root – defaults to ./galleries, overrideable via env var

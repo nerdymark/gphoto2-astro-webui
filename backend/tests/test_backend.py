@@ -894,3 +894,46 @@ class TestAPI:
         resp = client.get("/api/images/serve_test/red.jpg")
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("image/")
+
+
+# ---------------------------------------------------------------------------
+# LOG_LEVEL env var tests
+# ---------------------------------------------------------------------------
+
+
+def test_log_level_env_var_defaults_to_info(monkeypatch):
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    if "main" in sys.modules:
+        del sys.modules["main"]
+    import main  # noqa: PLC0415
+
+    assert main._LOG_LEVEL == "INFO"
+
+
+def test_log_level_env_var_debug(monkeypatch):
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    if "main" in sys.modules:
+        del sys.modules["main"]
+    import main  # noqa: PLC0415
+
+    assert main._LOG_LEVEL == "DEBUG"
+
+
+def test_log_level_env_var_lowercase_is_uppercased(monkeypatch):
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    if "main" in sys.modules:
+        del sys.modules["main"]
+    import main  # noqa: PLC0415
+
+    assert main._LOG_LEVEL == "DEBUG"
+
+
+def test_log_level_invalid_value_warns(monkeypatch, caplog):
+    monkeypatch.setenv("LOG_LEVEL", "TRACE")
+    if "main" in sys.modules:
+        del sys.modules["main"]
+    with caplog.at_level(logging.WARNING, logger="main"):
+        import main  # noqa: PLC0415
+
+    assert main._LOG_LEVEL == "TRACE"
+    assert any("TRACE" in r.message for r in caplog.records)

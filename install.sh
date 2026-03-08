@@ -145,9 +145,13 @@ Type=simple
 User=${USER}
 WorkingDirectory=${REPO_DIR}/backend
 Environment="GALLERY_ROOT=${REPO_DIR}/galleries"
+# LOG_LEVEL controls both Python application logging and uvicorn's own logging.
+# Use lowercase values (debug, info, warning, error, critical) for uvicorn compatibility.
+# To enable debug logging: change the value below to "debug" and restart the service.
+Environment="LOG_LEVEL=info"
 ExecStartPre=-/usr/bin/pkill -f gvfs-gphoto2-volume-monitor
 ExecStartPre=-/usr/bin/pkill -f gvfsd-gphoto2
-ExecStart=${REPO_DIR}/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+ExecStart=${REPO_DIR}/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level \${LOG_LEVEL}
 Restart=on-failure
 RestartSec=5
 
