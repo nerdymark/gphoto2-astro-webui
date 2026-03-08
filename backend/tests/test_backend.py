@@ -156,7 +156,7 @@ class TestCameraModule:
             cam._kill_gvfs_monitor()  # must not raise
 
     def test_kill_gvfs_monitor_kills_gvfsd_gphoto2(self):
-        """_kill_gvfs_monitor must also kill gvfsd-gphoto2, which holds the USB interface."""
+        """_kill_gvfs_monitor must target gvfsd-gphoto2, which holds the USB interface."""
         import camera as cam
 
         with (
@@ -172,8 +172,33 @@ class TestCameraModule:
             "gvfsd-gphoto2 was not targeted; it holds the USB interface and must be stopped"
         )
 
+    def test_kill_gvfs_monitor_kills_gvfs_mtp_volume_monitor(self):
+        """_kill_gvfs_monitor must also target the MTP volume monitor and its worker.
+
+        The Nikon D780 (and other PTP/MTP-only cameras) enumerate as MTP devices,
+        so gvfs-mtp-volume-monitor claims the camera instead of
+        gvfs-gphoto2-volume-monitor.  Both sets of daemons must be stopped.
+        """
+        import camera as cam
+
+        with (
+            patch("camera.subprocess.run") as mock_run,
+            patch("camera.time.sleep"),
+        ):
+            cam._kill_gvfs_monitor()
+
+        called_cmds = [call.args[0] for call in mock_run.call_args_list]
+        command_strings = [" ".join(cmd) for cmd in called_cmds]
+        assert any("gvfs-mtp-volume-monitor" in c for c in command_strings), (
+            "gvfs-mtp-volume-monitor was not targeted; on cameras like the Nikon D780 "
+            "this is the process that claims the USB interface"
+        )
+        assert any("gvfsd-mtp" in c for c in command_strings), (
+            "gvfsd-mtp was not targeted; it is the MTP worker that holds the camera session"
+        )
+
     def test_kill_gvfs_monitor_warning_mentions_gvfsd(self, caplog):
-        """The warning log should mention gvfsd-gphoto2 so operators know what was stopped."""
+        """The warning log should mention both the gphoto2 and MTP daemons."""
         import camera as cam
 
         with (
@@ -185,6 +210,7 @@ class TestCameraModule:
 
         log_messages = " ".join(r.message for r in caplog.records)
         assert "gvfsd-gphoto2" in log_messages
+        assert "gvfs-mtp-volume-monitor" in log_messages
 
     def test_run_gives_up_after_max_usb_retries(self):
         """After _USB_MAX_ATTEMPTS failed attempts, _run stops retrying and raises."""
@@ -457,6 +483,7 @@ class TestCameraModule:
         gphoto2 can return exit code 0 while writing a PTP error to stderr when
         the camera is in a state that blocks software-triggered captures.  The
         error must be surfaced to the caller instead of the generic fallback.
+        All retry attempts fail here to verify the final RuntimeError.
         """
         import camera as cam
 
@@ -478,6 +505,7 @@ class TestCameraModule:
             patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
             patch.object(cam, "is_camera_connected", return_value=True),
             patch.object(cam, "_run", side_effect=mock_run),
+            patch.object(cam, "_kill_gvfs_monitor"),
         ):
             with pytest.raises(RuntimeError, match="PTP Access Denied"):
                 cam.capture_image(tmp_path)
@@ -501,12 +529,87 @@ class TestCameraModule:
             patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
             patch.object(cam, "is_camera_connected", return_value=True),
             patch.object(cam, "_run", side_effect=mock_run),
+            patch.object(cam, "_kill_gvfs_monitor"),
             caplog.at_level(logging.ERROR, logger="camera"),
         ):
             with pytest.raises(RuntimeError):
                 cam.capture_image(tmp_path)
 
         assert any("PTP Access Denied" in r.message for r in caplog.records)
+
+    def test_capture_image_ptp_access_denied_retries_with_gvfs_kill(self, tmp_path):
+        """PTP access denied on the first attempt: gvfs is killed and capture retries.
+
+        On cameras like the Nikon D780 that use PTP/MTP as their only USB mode,
+        gvfs-gphoto2 opens a PTP session automatically when the camera is
+        connected.  The retry mechanism kills those daemons between attempts so
+        the second attempt can succeed.
+        """
+        import camera as cam
+
+        ptp_stderr = "*** Error ***\nPTP Access Denied\nERROR: Could not capture."
+        capture_call_count = 0
+
+        def mock_run(args, check=True, cwd=None):
+            nonlocal capture_call_count
+            if "--capture-image-and-download" in args:
+                capture_call_count += 1
+                if capture_call_count == 1:
+                    return subprocess.CompletedProcess(
+                        args=args, returncode=0, stdout="", stderr=ptp_stderr
+                    )
+                # Second attempt succeeds
+                if cwd:
+                    (Path(cwd) / "20240308-173422-00001.JPG").write_bytes(b"\xff\xd8fake")
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout="", stderr=""
+                )
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+            patch.object(cam, "_kill_gvfs_monitor") as mock_kill,
+        ):
+            result = cam.capture_image(tmp_path)
+
+        assert result.exists(), "capture_image must return a valid file path on retry"
+        assert capture_call_count == 2, "Expected exactly two capture attempts"
+        assert mock_kill.call_count == 1, (
+            "gvfs daemons must be killed exactly once between the failed and successful attempt"
+        )
+
+    def test_capture_image_ptp_access_denied_all_retries_kill_gvfs(self, tmp_path):
+        """Each PTP access denied attempt must kill gvfs before the next retry.
+
+        When all _PTP_MAX_ATTEMPTS fail, gvfs must have been killed
+        (_PTP_MAX_ATTEMPTS - 1) times (once between each pair of attempts).
+        """
+        import camera as cam
+
+        ptp_stderr = "*** Error ***\nPTP Access Denied\nERROR: Could not capture."
+
+        def mock_run(args, check=True, cwd=None):
+            if "--capture-image-and-download" in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout="", stderr=ptp_stderr
+                )
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+            patch.object(cam, "_kill_gvfs_monitor") as mock_kill,
+        ):
+            with pytest.raises(RuntimeError, match="PTP Access Denied"):
+                cam.capture_image(tmp_path)
+
+        assert mock_kill.call_count == cam._PTP_MAX_ATTEMPTS - 1, (
+            f"Expected gvfs to be killed {cam._PTP_MAX_ATTEMPTS - 1} time(s) "
+            f"(once per retry gap); got {mock_kill.call_count}"
+        )
 
     def test_capture_image_could_not_capture_stderr_raises(self, tmp_path):
         """'ERROR: Could not capture' in stderr with exit 0 raises RuntimeError."""

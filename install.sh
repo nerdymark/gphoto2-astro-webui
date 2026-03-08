@@ -177,6 +177,62 @@ else
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# udev rule: prevent gvfs from auto-mounting cameras controlled by gphoto2
+#
+# Cameras like the Nikon D780 use PTP/MTP as their only USB mode.  When such
+# a camera is plugged in, gvfs-mtp-volume-monitor (on desktop systems) or
+# gvfs-gphoto2-volume-monitor automatically opens an MTP/PTP session with it.
+# If that session is still active when gphoto2 tries to capture an image, the
+# camera firmware returns "PTP Access Denied" and the capture fails.
+#
+# Setting GVFS_IGNORE=1 in the udev environment tells both
+# gvfs-mtp-volume-monitor and gvfs-gphoto2-volume-monitor not to mount any
+# device that libgphoto2 recognises (ENV{ID_GPHOTO2} is set to "1" by
+# /lib/udev/rules.d/69-libgphoto2.rules for all supported cameras).
+# The GROUP and MODE lines grant the plugdev group read/write access to the
+# camera's USB device node so gphoto2 can open it without root.
+# ---------------------------------------------------------------------------
+UDEV_RULE_FILE="/etc/udev/rules.d/70-gphoto2-noautomount.rules"
+if [[ ! -f "$UDEV_RULE_FILE" ]]; then
+    info "Installing udev rule to prevent gvfs from auto-mounting gphoto2 cameras…"
+    sudo tee "$UDEV_RULE_FILE" > /dev/null << 'EOF'
+# Prevent gvfs from auto-mounting cameras that gphoto2 manages.
+# Without this rule, gvfs-mtp-volume-monitor or gvfs-gphoto2-volume-monitor
+# opens a session automatically when a PTP/MTP-only camera (e.g. Nikon D780)
+# is connected, causing gphoto2 to receive "PTP Access Denied" when it tries
+# to capture an image.  GVFS_IGNORE tells both volume monitors to skip these
+# devices.
+SUBSYSTEM=="usb", ENV{ID_GPHOTO2}=="1", ENV{GVFS_IGNORE}="1", GROUP="plugdev", MODE="0664"
+EOF
+else
+    info "udev rule ${UDEV_RULE_FILE} already exists – preserving."
+fi
+
+# Reload udev rules and re-tag any already-connected camera devices so the
+# new permissions and GVFS_IGNORE flag apply immediately without a replug.
+info "Reloading udev rules…"
+sudo udevadm control --reload-rules
+sudo udevadm trigger --action=add --subsystem-match=usb 2>/dev/null \
+    || sudo udevadm trigger
+
+# ---------------------------------------------------------------------------
+# Ensure the service user is in the plugdev group
+#
+# The udev rule above sets the camera device node to group plugdev with mode
+# 0664.  The user running the service must therefore be a member of plugdev
+# to open the device without root.  Group membership changes take effect on
+# the next login; newgrp or a re-login is needed in the current shell.
+# ---------------------------------------------------------------------------
+if ! groups "${USER}" | grep -qw plugdev; then
+    info "Adding ${USER} to the plugdev group for camera USB access…"
+    sudo usermod -aG plugdev "${USER}"
+    warn "Group membership change takes effect on the NEXT LOGIN."
+    warn "Log out and back in (or run: newgrp plugdev) for gphoto2 to work."
+else
+    info "${USER} is already in the plugdev group."
+fi
+
 # Node.js (v20 LTS)
 if ! command -v node &>/dev/null; then
     # Detect architecture; NodeSource does not support armhf (32-bit ARM).
@@ -213,20 +269,33 @@ fi
 
 # ---------------------------------------------------------------------------
 # Disable GNOME VFS camera daemons
-# Two cooperating GNOME VFS processes auto-mount cameras over MTP/PTP and can
-# hold the USB interface, preventing gphoto2 from accessing the device (error
-# -53: 'Could not claim the USB device'):
-#   gvfs-gphoto2-volume-monitor – detects newly attached cameras
-#   gvfsd-gphoto2               – the worker that actually claims the USB interface
-# Mask the volume monitor so it no longer auto-starts, and kill both processes
-# now so the camera is immediately available.  No sudo is required because both
-# processes run as the current user (${USER}).
+#
+# Three groups of GNOME VFS processes auto-mount cameras over MTP/PTP and hold
+# the USB interface, preventing gphoto2 from accessing the device:
+#
+#   gvfs-gphoto2-volume-monitor / gvfsd-gphoto2
+#       Used when the camera is detected as a PTP device via libgphoto2 udev rules.
+#
+#   gvfs-mtp-volume-monitor / gvfsd-mtp
+#       Used when the camera enumerates as an MTP device.  Cameras like the
+#       Nikon D780 use PTP/MTP as their *only* USB mode, so the OS always sees
+#       them as MTP.  On Raspberry Pi OS Desktop, gvfs-mtp-volume-monitor starts
+#       at login and immediately claims the camera – this is the primary cause of
+#       the "PTP Access Denied" error reported by gphoto2.
+#
+# Mask both volume monitors so they no longer auto-start, and kill all four
+# processes now so the camera is immediately available.  No sudo is required
+# because all processes run as the current user (${USER}).
 # ---------------------------------------------------------------------------
-info "Masking gvfs-gphoto2-volume-monitor and stopping GNOME VFS camera daemons…"
+info "Masking GNOME VFS camera volume monitors and stopping their worker daemons…"
 systemctl --user mask gvfs-gphoto2-volume-monitor 2>/dev/null \
     && systemctl --user stop gvfs-gphoto2-volume-monitor 2>/dev/null \
     || warn "Could not mask gvfs-gphoto2-volume-monitor (may not be installed – this is fine)"
+systemctl --user mask gvfs-mtp-volume-monitor 2>/dev/null \
+    && systemctl --user stop gvfs-mtp-volume-monitor 2>/dev/null \
+    || warn "Could not mask gvfs-mtp-volume-monitor (may not be installed – this is fine)"
 pkill -f gvfsd-gphoto2 2>/dev/null || true
+pkill -f gvfsd-mtp 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 2. Python virtual environment
@@ -295,6 +364,8 @@ Environment="LOG_LEVEL=info"
 EnvironmentFile=-${ENV_FILE}
 ExecStartPre=-/usr/bin/pkill -f gvfs-gphoto2-volume-monitor
 ExecStartPre=-/usr/bin/pkill -f gvfsd-gphoto2
+ExecStartPre=-/usr/bin/pkill -f gvfs-mtp-volume-monitor
+ExecStartPre=-/usr/bin/pkill -f gvfsd-mtp
 ExecStart=${REPO_DIR}/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level \${LOG_LEVEL}
 Restart=on-failure
 RestartSec=5

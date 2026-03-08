@@ -25,6 +25,17 @@ USB_CLAIM_ERROR = "Could not claim the USB device"
 # Maximum number of attempts when a USB claim error is encountered.
 _USB_MAX_ATTEMPTS = 3
 
+# Substring present in gphoto2 stderr when the camera denies a PTP request.
+# Cameras like the Nikon D780 use PTP/MTP as their only USB mode, so gvfs
+# automatically opens a PTP session when the camera is connected.  If gvfs
+# still holds that session when gphoto2 tries to capture, the camera firmware
+# returns "PTP Access Denied".  Killing the gvfs daemons closes the competing
+# session; retrying the capture after that usually succeeds.
+PTP_ACCESS_ERROR = "PTP Access Denied"
+
+# Maximum number of capture attempts when a PTP access error is encountered.
+_PTP_MAX_ATTEMPTS = 3
+
 # Serialise all gphoto2 calls so that concurrent HTTP requests cannot race to
 # claim the camera's USB interface.  RLock is used because some public
 # functions call _run() more than once in the same thread (e.g.
@@ -36,27 +47,37 @@ _camera_lock = threading.RLock()
 def _kill_gvfs_monitor() -> None:
     """Stop GNOME VFS processes that hold the camera's USB interface.
 
-    The GNOME Virtual File System uses two cooperating processes for camera access:
-    * gvfs-gphoto2-volume-monitor – detects newly attached cameras and triggers
-      mounting.
-    * gvfsd-gphoto2 – the worker daemon that actually claims the USB interface and
-      provides filesystem access to the camera.
+    Three groups of cooperating GNOME VFS processes can claim a camera's USB
+    interface, depending on how the camera presents itself to the OS:
 
-    Killing only the volume monitor leaves gvfsd-gphoto2 running with the interface
-    still claimed.  Both must be stopped so gphoto2 can acquire the device and avoid
-    error -53 ('Could not claim the USB device').
+    * gvfs-gphoto2-volume-monitor / gvfsd-gphoto2 – used when the camera is
+      detected as a PTP device by libgphoto2's udev rules.
+    * gvfs-mtp-volume-monitor / gvfsd-mtp – used when the camera enumerates as
+      an MTP device.  Cameras like the Nikon D780 use PTP/MTP as their *only*
+      USB mode, so the OS always sees them as MTP.  On Raspberry Pi OS Desktop
+      gvfs-mtp-volume-monitor auto-starts at login and immediately claims the
+      camera, making it the primary cause of "PTP Access Denied" errors.
 
-    sudo is not required: both daemons run as the same user that owns this process,
-    so an unprivileged pkill is sufficient to terminate them.
+    Killing only the volume monitor leaves the worker daemon running with the
+    interface still claimed.  Both monitor and worker must be stopped for each
+    group so gphoto2 can acquire the device and avoid error -53
+    ('Could not claim the USB device') or 'PTP Access Denied'.
+
+    sudo is not required: all daemons run as the same user that owns this
+    process, so an unprivileged pkill is sufficient to terminate them.
     """
     logger.warning(
         "USB device is claimed by another process; "
-        "attempting to stop gvfs-gphoto2-volume-monitor and gvfsd-gphoto2…"
+        "attempting to stop gvfs-gphoto2-volume-monitor, gvfsd-gphoto2, "
+        "gvfs-mtp-volume-monitor, and gvfsd-mtp…"
     )
     for cmd in (
         ["systemctl", "--user", "stop", "gvfs-gphoto2-volume-monitor"],
         ["pkill", "-f", "gvfs-gphoto2-volume-monitor"],
         ["pkill", "-f", "gvfsd-gphoto2"],
+        ["systemctl", "--user", "stop", "gvfs-mtp-volume-monitor"],
+        ["pkill", "-f", "gvfs-mtp-volume-monitor"],
+        ["pkill", "-f", "gvfsd-mtp"],
     ):
         try:
             subprocess.run(cmd, capture_output=True, timeout=5)
@@ -336,39 +357,62 @@ def capture_image(gallery_path: Path) -> Path:
                     (ct.stderr or "").strip(),
                 )
             logger.debug("capture_image: starting capture into tmpdir=%s", tmpdir)
-            result = _run(
-                [
-                    "--capture-image-and-download",
-                    "--filename",
-                    # Basename only – gphoto2 expands format codes and writes the
-                    # file relative to cwd (tmpdir), which is more reliable than
-                    # embedding an absolute path in the --filename template.
-                    "%Y%m%d-%H%M%S-%05n.%C",
-                    "--force-overwrite",
-                ],
-                cwd=tmpdir,
-            )
-            stderr_stripped = (result.stderr or "").strip()
-            logger.debug(
-                "capture_image: gphoto2 stdout=%r stderr=%r",
-                (result.stdout or "").strip(),
-                stderr_stripped,
-            )
-            # gphoto2 sometimes exits with code 0 while printing a capture
-            # error to stderr (e.g. "PTP Access Denied" when the camera is in
-            # a state that blocks software-triggered captures).  Detect these
-            # patterns early so callers receive the real error rather than the
-            # generic "no file was downloaded" fallback.
-            if stderr_stripped and (
-                "PTP Access Denied" in stderr_stripped
-                or "ERROR: Could not capture" in stderr_stripped
-            ):
-                logger.error(
-                    "capture_image: gphoto2 exited 0 but reported a capture"
-                    " error – stderr=%r",
+            # Retry on PTP access errors.  On cameras like the Nikon D780 that
+            # use PTP/MTP as their only USB mode, gvfs-mtp-volume-monitor
+            # automatically opens an MTP session when the camera is connected.
+            # If that session is still active when gphoto2 tries to capture,
+            # the camera firmware returns "PTP Access Denied" (exit 0) instead
+            # of downloading the image.  Killing the gvfs daemons between
+            # attempts closes the competing session so the next attempt can
+            # succeed.
+            for attempt in range(_PTP_MAX_ATTEMPTS):
+                result = _run(
+                    [
+                        "--capture-image-and-download",
+                        "--filename",
+                        # Basename only – gphoto2 expands format codes and writes
+                        # the file relative to cwd (tmpdir), which is more
+                        # reliable than embedding an absolute path in the
+                        # --filename template.
+                        "%Y%m%d-%H%M%S-%05n.%C",
+                        "--force-overwrite",
+                    ],
+                    cwd=tmpdir,
+                )
+                stderr_stripped = (result.stderr or "").strip()
+                logger.debug(
+                    "capture_image: gphoto2 stdout=%r stderr=%r",
+                    (result.stdout or "").strip(),
                     stderr_stripped,
                 )
-                raise RuntimeError(f"Capture failed: {stderr_stripped}")
+                # gphoto2 sometimes exits with code 0 while printing a capture
+                # error to stderr.  Detect these patterns early so callers
+                # receive the real error rather than the generic "no file was
+                # downloaded" fallback.
+                if stderr_stripped and PTP_ACCESS_ERROR in stderr_stripped:
+                    if attempt < _PTP_MAX_ATTEMPTS - 1:
+                        logger.warning(
+                            "capture_image: PTP access denied (attempt %d/%d)"
+                            " – killing gvfs camera daemons and retrying…",
+                            attempt + 1,
+                            _PTP_MAX_ATTEMPTS,
+                        )
+                        _kill_gvfs_monitor()
+                        continue
+                    logger.error(
+                        "capture_image: gphoto2 exited 0 but reported a capture"
+                        " error – stderr=%r",
+                        stderr_stripped,
+                    )
+                    raise RuntimeError(f"Capture failed: {stderr_stripped}")
+                if stderr_stripped and "ERROR: Could not capture" in stderr_stripped:
+                    logger.error(
+                        "capture_image: gphoto2 exited 0 but reported a capture"
+                        " error – stderr=%r",
+                        stderr_stripped,
+                    )
+                    raise RuntimeError(f"Capture failed: {stderr_stripped}")
+                break
             captured = list(Path(tmpdir).iterdir())
             logger.debug("capture_image: files in tmpdir after capture: %s", captured)
             if not captured:
