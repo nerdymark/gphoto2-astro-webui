@@ -5,7 +5,9 @@ Run with:  cd backend && pytest tests/
 """
 
 import io
+import logging
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -60,7 +62,6 @@ class TestCameraModule:
 
     def test_get_camera_summary_gphoto2_error_logs_stderr(self):
         """CalledProcessError from gphoto2 --summary should log stderr and return connected=False."""
-        import subprocess
         import camera as cam
 
         fake_exc = subprocess.CalledProcessError(
@@ -78,6 +79,46 @@ class TestCameraModule:
 
         assert result["connected"] is False
         assert "Could not claim the USB device" in result["summary"]
+
+    def test_get_config_value_usb_error_logs_stderr(self, caplog):
+        """CalledProcessError from --get-config should be logged, not silently swallowed."""
+        import camera as cam
+
+        fake_exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["/usr/bin/gphoto2", "--get-config", "iso"],
+            stderr="*** Error (-53: 'Could not claim the USB device')",
+            output="",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", side_effect=fake_exc),
+            caplog.at_level(logging.ERROR, logger="camera"),
+        ):
+            result = cam._get_config_value("iso")
+
+        assert result is None
+        assert any("Could not claim the USB device" in r.message for r in caplog.records)
+
+    def test_get_config_choices_usb_error_logs_stderr(self, caplog):
+        """CalledProcessError from --get-config (choices) should be logged, not silently swallowed."""
+        import camera as cam
+
+        fake_exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["/usr/bin/gphoto2", "--get-config", "shutterspeed"],
+            stderr="*** Error (-53: 'Could not claim the USB device')",
+            output="",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", side_effect=fake_exc),
+            caplog.at_level(logging.ERROR, logger="camera"),
+        ):
+            result = cam._get_config_choices("shutterspeed")
+
+        assert result == []
+        assert any("Could not claim the USB device" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

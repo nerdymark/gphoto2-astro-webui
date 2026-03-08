@@ -70,8 +70,15 @@ def _get_config_value(key: str) -> Optional[str]:
         for line in result.stdout.splitlines():
             if line.strip().startswith("Current:"):
                 return line.split(":", 1)[1].strip()
-    except Exception:
-        pass
+    except subprocess.CalledProcessError as exc:
+        logger.error(
+            "_get_config_value(%r) failed (exit %d): %s",
+            key,
+            exc.returncode,
+            (exc.stderr or "").strip() or (exc.stdout or "").strip(),
+        )
+    except Exception as exc:
+        logger.error("_get_config_value(%r) unexpected error: %s", key, exc)
     return None
 
 
@@ -88,8 +95,16 @@ def _get_config_choices(key: str) -> list[str]:
                 if len(parts) == 3:
                     choices.append(parts[2])
         return choices
-    except Exception:
-        return []
+    except subprocess.CalledProcessError as exc:
+        logger.error(
+            "_get_config_choices(%r) failed (exit %d): %s",
+            key,
+            exc.returncode,
+            (exc.stderr or "").strip() or (exc.stdout or "").strip(),
+        )
+    except Exception as exc:
+        logger.error("_get_config_choices(%r) unexpected error: %s", key, exc)
+    return []
 
 
 def get_exposure_settings() -> dict:
