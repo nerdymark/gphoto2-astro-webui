@@ -72,6 +72,13 @@ class CaptureRequest(BaseModel):
     bulb_seconds: Optional[int] = None
 
 
+class BurstRequest(BaseModel):
+    gallery: str
+    count: int = 1
+    interval: float = 0
+    bulb_seconds: Optional[int] = None
+
+
 class StackRequest(BaseModel):
     images: list[str]
     mode: str = "mean"
@@ -128,6 +135,33 @@ def capture_image(req: CaptureRequest):
         "gallery": req.gallery,
         "filename": saved.name,
         "url": f"/api/images/{req.gallery}/{saved.name}",
+    }
+
+
+@app.post("/api/camera/burst")
+def capture_burst(req: BurstRequest):
+    """Capture multiple frames in a single session (one gvfs kill + liveview)."""
+    if req.count < 1:
+        raise HTTPException(status_code=400, detail="count must be >= 1")
+    gallery_dir = _gallery_path(req.gallery)
+    try:
+        saved = cam.capture_burst(
+            gallery_dir,
+            count=req.count,
+            interval=req.interval,
+            bulb_seconds=req.bulb_seconds,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "gallery": req.gallery,
+        "captured": len(saved),
+        "requested": req.count,
+        "files": [
+            {"filename": p.name, "url": f"/api/images/{req.gallery}/{p.name}"}
+            for p in saved
+        ],
     }
 
 

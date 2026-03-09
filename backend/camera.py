@@ -548,6 +548,87 @@ def capture_image(gallery_path: Path, bulb_seconds: Optional[int] = None) -> Pat
         _capture_active.clear()
 
 
+def capture_burst(
+    gallery_path: Path,
+    count: int = 1,
+    interval: float = 0,
+    bulb_seconds: Optional[int] = None,
+) -> list[Path]:
+    """Capture *count* images into *gallery_path* in a single session.
+
+    Performs gvfs cleanup and Live View setup once, then captures all frames
+    sequentially.  This is much faster and more reliable than calling
+    :func:`capture_image` in a loop because gvfs won't reclaim the USB
+    interface between frames.
+
+    *interval* is the pause in seconds between the end of one capture and the
+    start of the next (0 = back-to-back).
+
+    Returns a list of saved file paths (one per successful frame).
+    """
+    gallery_path.mkdir(parents=True, exist_ok=True)
+
+    if not GPHOTO2_BIN or not is_camera_connected():
+        return [_simulate_capture(gallery_path) for _ in range(count)]
+
+    bulb = is_bulb_mode()
+    if bulb:
+        logger.info("capture_burst: camera is in Bulb/Time mode")
+
+    _capture_active.set()
+    try:
+        saved: list[Path] = []
+        # Kill gvfs once at the start of the burst.
+        _kill_gvfs_monitor()
+        for i in range(count):
+            if i > 0 and interval > 0:
+                time.sleep(interval)
+            logger.info("capture_burst: frame %d/%d", i + 1, count)
+            # Re-enable liveview before each frame – the camera exits Live
+            # View after every capture (mirror flips back down).  On frames
+            # after the first we skip the gvfs kill since we already did it.
+            _set_viewfinder(skip_gvfs=(i > 0))
+            try:
+                path = _do_capture_frame(gallery_path, bulb, bulb_seconds)
+                saved.append(path)
+            except RuntimeError as exc:
+                logger.error("capture_burst: frame %d failed: %s", i + 1, exc)
+                # Full recovery for the next frame.
+                _kill_gvfs_monitor()
+        return saved
+    finally:
+        _capture_active.clear()
+
+
+def _do_capture_frame(
+    gallery_path: Path, bulb: bool, bulb_seconds: Optional[int]
+) -> Path:
+    """Capture a single frame without liveview/gvfs setup (caller handles that)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            if bulb:
+                _bulb_capture_raw(tmpdir, bulb_seconds)
+            else:
+                _normal_capture_raw(tmpdir)
+
+            captured = list(Path(tmpdir).iterdir())
+            if not captured:
+                raise RuntimeError("gphoto2 captured nothing")
+            src = captured[0]
+            dst = gallery_path / src.name
+            shutil.move(str(src), str(dst))
+            logger.debug("capture_frame: saved %s -> %s", src, dst)
+            return dst
+        except subprocess.CalledProcessError as exc:
+            logger.error(
+                "capture_frame failed (exit %d): stderr=%r stdout=%r",
+                exc.returncode,
+                (exc.stderr or "").strip(),
+                (exc.stdout or "").strip(),
+            )
+            raise RuntimeError(f"Capture failed: {exc.stderr}") from exc
+
+
 def _do_capture(
     gallery_path: Path, bulb: bool, bulb_seconds: Optional[int]
 ) -> Path:
@@ -582,64 +663,63 @@ def _do_capture(
 
 _LIVEVIEW_MAX_ATTEMPTS = 3
 
+# Seconds to wait after setting viewfinder=1 for the mirror to flip.
+_LIVEVIEW_SETTLE_SECONDS = 3
 
-def _enable_liveview() -> None:
-    """Enable Live View (viewfinder=1) and wait for the mirror to flip.
 
-    Cameras like the Nikon D780 reject PTP InitiateCapture with "Access
-    Denied" unless the mirror is up / Live View is active.  The mirror flip
-    takes about 1-2 seconds, so we issue viewfinder=1 in its own gphoto2
-    invocation and wait before proceeding to the actual capture command.
+def _set_viewfinder(skip_gvfs: bool = False) -> None:
+    """Set viewfinder=1 with retry logic.
 
-    Retries up to _LIVEVIEW_MAX_ATTEMPTS times if gvfs is interfering.
+    Like _enable_liveview but *skip_gvfs* can skip the initial gvfs kill
+    (useful when gvfs was already killed recently, e.g. burst frames 2+).
     """
-    _kill_gvfs_monitor()
+    if not skip_gvfs:
+        _kill_gvfs_monitor()
     for attempt in range(_LIVEVIEW_MAX_ATTEMPTS):
         try:
-            result = _run(
-                ["--set-config", "viewfinder=1"], check=False
-            )
+            result = _run(["--set-config", "viewfinder=1"], check=False)
             stderr = (result.stderr or "").strip()
             if result.returncode == 0:
-                logger.info("_enable_liveview: viewfinder=1 set successfully")
-                # Give the camera time to raise the mirror and enter Live View.
-                time.sleep(2)
+                logger.info("_set_viewfinder: viewfinder=1 set successfully")
+                time.sleep(_LIVEVIEW_SETTLE_SECONDS)
                 return
-            # Check for PTP/USB conflicts that are worth retrying.
             if (
                 PTP_ACCESS_ERROR in stderr
                 or PTP_SESSION_ERROR in stderr
                 or USB_CLAIM_ERROR in stderr
             ):
                 logger.warning(
-                    "_enable_liveview: PTP/USB conflict setting viewfinder "
-                    "(attempt %d/%d) – killing gvfs and retrying",
+                    "_set_viewfinder: PTP/USB conflict (attempt %d/%d)",
                     attempt + 1,
                     _LIVEVIEW_MAX_ATTEMPTS,
                 )
                 _kill_gvfs_monitor()
                 continue
-            # Non-retryable error (e.g. camera doesn't support viewfinder).
-            logger.debug(
-                "_enable_liveview: viewfinder=1 failed (non-retryable): %s",
-                stderr,
-            )
+            logger.debug("_set_viewfinder: non-retryable error: %s", stderr)
             return
         except subprocess.CalledProcessError:
-            logger.debug(
-                "_enable_liveview: viewfinder config not supported, skipping"
-            )
+            logger.debug("_set_viewfinder: viewfinder not supported, skipping")
             return
-    logger.warning(
-        "_enable_liveview: failed to set viewfinder after %d attempts, "
-        "proceeding with capture anyway",
-        _LIVEVIEW_MAX_ATTEMPTS,
-    )
+    logger.warning("_set_viewfinder: gave up after %d attempts", _LIVEVIEW_MAX_ATTEMPTS)
+
+
+def _enable_liveview() -> None:
+    """Enable Live View (viewfinder=1) with gvfs cleanup and retry.
+
+    Convenience wrapper around _set_viewfinder that always kills gvfs first.
+    Used by the single-capture path (capture_image).
+    """
+    _set_viewfinder(skip_gvfs=False)
 
 
 def _normal_capture(tmpdir: str) -> None:
-    """Standard capture-and-download with PTP retry logic."""
+    """Standard capture-and-download: liveview setup + raw capture."""
     _enable_liveview()
+    _normal_capture_raw(tmpdir)
+
+
+def _normal_capture_raw(tmpdir: str) -> None:
+    """Standard capture-and-download with PTP retry logic (no liveview setup)."""
     for attempt in range(_PTP_MAX_ATTEMPTS):
         result = _run(
             [
@@ -684,6 +764,12 @@ def _normal_capture(tmpdir: str) -> None:
 
 
 def _bulb_capture(tmpdir: str, bulb_seconds: Optional[int] = None) -> None:
+    """Bulb-mode capture: liveview setup + raw bulb capture."""
+    _enable_liveview()
+    _bulb_capture_raw(tmpdir, bulb_seconds)
+
+
+def _bulb_capture_raw(tmpdir: str, bulb_seconds: Optional[int] = None) -> None:
     """Bulb-mode capture using the Nikon epress2 / epress2off sequence.
 
     Standard ``--capture-image-and-download`` sends a single InitiateCapture
@@ -700,10 +786,6 @@ def _bulb_capture(tmpdir: str, bulb_seconds: Optional[int] = None) -> None:
     """
     duration = bulb_seconds if bulb_seconds is not None else _DEFAULT_BULB_SECONDS
     logger.info("_bulb_capture: exposing for %d seconds", duration)
-
-    # Enable Live View first – cameras like the Nikon D780 reject PTP capture
-    # commands unless the mirror is up / Live View is active.
-    _enable_liveview()
 
     # Try Nikon-style epress2 first, then generic bulb.
     # Set capturetarget in the same call that opens the shutter.
