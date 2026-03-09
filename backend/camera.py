@@ -44,6 +44,18 @@ PTP_SESSION_ERROR = "PTP Session Already Opened"
 # Maximum number of capture attempts when a PTP access error is encountered.
 _PTP_MAX_ATTEMPTS = 3
 
+# Nikon PTP sentinel values for special exposure modes.  These appear as the
+# Exposure Time property value (0x500d) when the camera's shutter speed dial
+# is set to a non-timed mode.  A standard --capture-image-and-download fails
+# with "Invalid Status" when these are active because gphoto2 sends a single
+# InitiateCapture PTP operation whereas Bulb/Time require the two-phase
+# epress2/epress2off sequence.
+_BULB_SENTINEL = 4294967293   # 0xFFFFFFFD – Bulb mode
+_TIME_SENTINEL = 4294967295   # 0xFFFFFFFF – Time mode
+
+# Default bulb exposure duration (seconds) when no duration is specified.
+_DEFAULT_BULB_SECONDS = 10
+
 # Serialise all gphoto2 calls so that concurrent HTTP requests cannot race to
 # claim the camera's USB interface.  RLock is used because some public
 # functions call _run() more than once in the same thread (e.g.
@@ -393,6 +405,47 @@ def get_exposure_settings() -> dict:
     }
 
 
+def _detect_aperture_key() -> str:
+    """Return the gphoto2 config key for aperture on the connected camera.
+
+    Most cameras use ``aperture`` but Nikon bodies use ``f-number``.  We probe
+    the camera once and return whichever key is present.
+    """
+    _, choices = _get_config("aperture", warn_if_missing=False)
+    if choices:
+        return "aperture"
+    return "f-number"
+
+
+def _detect_shutter_key() -> str:
+    """Return the gphoto2 config key for shutter speed on the connected camera."""
+    _, choices = _get_config("shutterspeed", warn_if_missing=False)
+    if choices:
+        return "shutterspeed"
+    return "shutterspeed2"
+
+
+def is_bulb_mode() -> bool:
+    """Return True if the camera's shutter speed is set to Bulb or Time.
+
+    Nikon cameras report Bulb as exposure-time value 0xFFFFFFFD (4294967293)
+    and Time as 0xFFFFFFFF (4294967295).  gphoto2 renders these as very large
+    "seconds" values like ``4.3e+04 sec``.  The shutterspeed config key may
+    also report the literal string ``Bulb`` or ``Time``.
+    """
+    if not GPHOTO2_BIN:
+        return False
+    shutter_val, _ = _get_config("shutterspeed", warn_if_missing=False)
+    if shutter_val is None:
+        shutter_val, _ = _get_config("shutterspeed2", warn_if_missing=False)
+    if shutter_val is None:
+        return False
+    lower = shutter_val.lower()
+    if "bulb" in lower or "time" in lower:
+        return True
+    return False
+
+
 def set_exposure_settings(
     aperture: Optional[str] = None,
     shutter: Optional[str] = None,
@@ -404,9 +457,11 @@ def set_exposure_settings(
         return {"ok": True, "simulated": True}
     args = []
     if aperture:
-        args += ["--set-config", f"aperture={aperture}"]
+        key = _detect_aperture_key()
+        args += ["--set-config", f"{key}={aperture}"]
     if shutter:
-        args += ["--set-config", f"shutterspeed={shutter}"]
+        key = _detect_shutter_key()
+        args += ["--set-config", f"{key}={shutter}"]
     if iso:
         args += ["--set-config", f"iso={iso}"]
     if not args:
@@ -419,115 +474,52 @@ def set_exposure_settings(
         return {"ok": False, "error": exc.stderr}
 
 
-def capture_image(gallery_path: Path) -> Path:
-    """
-    Trigger the camera shutter, download the image, and save it into gallery_path.
+def capture_image(gallery_path: Path, bulb_seconds: Optional[int] = None) -> Path:
+    """Trigger the camera shutter, download the image, and save it into *gallery_path*.
+
+    When the camera's shutter speed is set to **Bulb** (or **Time**), the
+    standard ``--capture-image-and-download`` PTP operation fails with
+    "Invalid Status" because Bulb requires a two-phase shutter sequence.
+    This function detects Bulb mode automatically and falls back to the
+    ``epress2`` / ``epress2off`` config-key sequence used by Nikon bodies
+    (and the generic ``bulb=1`` / ``bulb=0`` for other vendors).
+
+    *bulb_seconds* overrides the exposure duration when in Bulb mode.
+    If ``None``, :data:`_DEFAULT_BULB_SECONDS` is used.
+
     Returns the path of the saved image file.
     """
     gallery_path.mkdir(parents=True, exist_ok=True)
 
     if not GPHOTO2_BIN or not is_camera_connected():
-        # Simulation: create a small blank JPEG
         return _simulate_capture(gallery_path)
+
+    # Detect bulb mode *before* killing gvfs so the config query doesn't race.
+    bulb = is_bulb_mode()
+    if bulb:
+        logger.info(
+            "capture_image: camera is in Bulb/Time mode – using bulb capture sequence"
+        )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
-            # Ensure the image is downloaded to the host rather than saved only
-            # to the camera's memory card.  capturetarget=0 means "Internal RAM"
-            # on most cameras; if the key is not supported the warning is logged
-            # and capture proceeds unchanged.
-            ct = _run(["--set-config", "capturetarget=0"], check=False)
-            if ct.returncode != 0:
-                logger.warning(
-                    "capture_image: could not set capturetarget=0: %s",
-                    (ct.stderr or "").strip(),
-                )
             logger.debug("capture_image: starting capture into tmpdir=%s", tmpdir)
             # Kill gvfs camera daemons proactively before the first capture
             # attempt.  On cameras that use PTP/MTP as their only USB mode
             # (e.g. Nikon D780), gvfs can (re)claim the PTP session in the
             # window between is_camera_connected() returning True and the first
-            # --capture-image-and-download call.  The fuse kernel module
-            # reporting an active user (lsmod) confirms gvfsd-fuse is running;
-            # its FUSE mount keeps gvfsd alive and able to restart worker
-            # daemons.  Killing and unmounting here avoids that race on the
-            # first attempt; the retry loop below handles any subsequent
-            # conflicts.
+            # capture call.
             _kill_gvfs_monitor()
-            # Retry on PTP access errors.  On cameras like the Nikon D780 that
-            # use PTP/MTP as their only USB mode, gvfs-mtp-volume-monitor
-            # automatically opens an MTP session when the camera is connected.
-            # If that session is still active when gphoto2 tries to capture,
-            # the camera firmware returns "PTP Access Denied" (exit 0) instead
-            # of downloading the image.  Killing the gvfs daemons between
-            # attempts closes the competing session so the next attempt can
-            # succeed.
-            for attempt in range(_PTP_MAX_ATTEMPTS):
-                result = _run(
-                    [
-                        "--capture-image-and-download",
-                        "--filename",
-                        # Basename only – gphoto2 expands format codes and writes
-                        # the file relative to cwd (tmpdir), which is more
-                        # reliable than embedding an absolute path in the
-                        # --filename template.
-                        "%Y%m%d-%H%M%S-%05n.%C",
-                        "--force-overwrite",
-                    ],
-                    cwd=tmpdir,
-                )
-                stderr_stripped = (result.stderr or "").strip()
-                logger.debug(
-                    "capture_image: gphoto2 stdout=%r stderr=%r",
-                    (result.stdout or "").strip(),
-                    stderr_stripped,
-                )
-                # gphoto2 sometimes exits with code 0 while printing a capture
-                # error to stderr.  Detect these patterns early so callers
-                # receive the real error rather than the generic "no file was
-                # downloaded" fallback.
-                ptp_error = stderr_stripped and (
-                    PTP_ACCESS_ERROR in stderr_stripped
-                    or PTP_SESSION_ERROR in stderr_stripped
-                )
-                if ptp_error:
-                    if attempt < _PTP_MAX_ATTEMPTS - 1:
-                        logger.warning(
-                            "capture_image: PTP access or session conflict (attempt %d/%d)"
-                            " – killing gvfs camera daemons and retrying…",
-                            attempt + 1,
-                            _PTP_MAX_ATTEMPTS,
-                        )
-                        _kill_gvfs_monitor()
-                        continue
-                    logger.error(
-                        "capture_image: gphoto2 exited 0 but reported a capture"
-                        " error – stderr=%r",
-                        stderr_stripped,
-                    )
-                    raise RuntimeError(f"Capture failed: {stderr_stripped}")
-                if stderr_stripped and "ERROR: Could not capture" in stderr_stripped:
-                    logger.error(
-                        "capture_image: gphoto2 exited 0 but reported a capture"
-                        " error – stderr=%r",
-                        stderr_stripped,
-                    )
-                    raise RuntimeError(f"Capture failed: {stderr_stripped}")
-                break
+
+            if bulb:
+                _bulb_capture(tmpdir, bulb_seconds)
+            else:
+                _normal_capture(tmpdir)
+
             captured = list(Path(tmpdir).iterdir())
             logger.debug("capture_image: files in tmpdir after capture: %s", captured)
             if not captured:
-                logger.error(
-                    "capture_image: gphoto2 exited successfully but no file was downloaded"
-                    " – stdout=%r stderr=%r",
-                    (result.stdout or "").strip(),
-                    stderr_stripped,
-                )
-                raise RuntimeError(
-                    f"Capture failed: {stderr_stripped}"
-                    if stderr_stripped
-                    else "gphoto2 captured nothing"
-                )
+                raise RuntimeError("gphoto2 captured nothing")
             src = captured[0]
             dst = gallery_path / src.name
             shutil.move(str(src), str(dst))
@@ -541,6 +533,104 @@ def capture_image(gallery_path: Path) -> Path:
                 (exc.stdout or "").strip(),
             )
             raise RuntimeError(f"Capture failed: {exc.stderr}") from exc
+
+
+def _normal_capture(tmpdir: str) -> None:
+    """Standard capture-and-download with PTP retry logic."""
+    for attempt in range(_PTP_MAX_ATTEMPTS):
+        # Set capturetarget in the same invocation so it persists.
+        result = _run(
+            [
+                "--set-config", "capturetarget=0",
+                "--capture-image-and-download",
+                "--filename",
+                "%Y%m%d-%H%M%S-%05n.%C",
+                "--force-overwrite",
+            ],
+            cwd=tmpdir,
+        )
+        stderr_stripped = (result.stderr or "").strip()
+        logger.debug(
+            "capture_image: gphoto2 stdout=%r stderr=%r",
+            (result.stdout or "").strip(),
+            stderr_stripped,
+        )
+        ptp_error = stderr_stripped and (
+            PTP_ACCESS_ERROR in stderr_stripped
+            or PTP_SESSION_ERROR in stderr_stripped
+        )
+        if ptp_error:
+            if attempt < _PTP_MAX_ATTEMPTS - 1:
+                logger.warning(
+                    "capture_image: PTP access or session conflict (attempt %d/%d)"
+                    " – killing gvfs camera daemons and retrying…",
+                    attempt + 1,
+                    _PTP_MAX_ATTEMPTS,
+                )
+                _kill_gvfs_monitor()
+                continue
+            raise RuntimeError(f"Capture failed: {stderr_stripped}")
+        if stderr_stripped and "ERROR: Could not capture" in stderr_stripped:
+            raise RuntimeError(f"Capture failed: {stderr_stripped}")
+        break
+
+
+def _bulb_capture(tmpdir: str, bulb_seconds: Optional[int] = None) -> None:
+    """Bulb-mode capture using the Nikon epress2 / epress2off sequence.
+
+    Standard ``--capture-image-and-download`` sends a single InitiateCapture
+    PTP operation which cameras reject with "Invalid Status" when in Bulb
+    mode.  Instead we:
+
+    1. Set ``capturetarget=0`` (Internal RAM) so the image is downloadable.
+    2. Open the shutter via ``epress2=on`` (Nikon) or ``bulb=1`` (generic).
+    3. Wait for the desired exposure duration.
+    4. Close the shutter via ``epress2=off`` / ``bulb=0``.
+    5. Wait for the CAPTURECOMPLETE event and download the file.
+
+    Falls back to ``bulb=1``/``bulb=0`` if ``epress2`` is not supported.
+    """
+    duration = bulb_seconds if bulb_seconds is not None else _DEFAULT_BULB_SECONDS
+    logger.info("_bulb_capture: exposing for %d seconds", duration)
+
+    # Try Nikon-style epress2 first, then generic bulb.
+    # Set capturetarget in the same call that opens the shutter.
+    try:
+        _run(
+            ["--set-config", "capturetarget=0", "--set-config", "epress2=on"],
+            check=True,
+        )
+        shutter_key = "epress2"
+        shutter_off = "epress2=off"
+    except subprocess.CalledProcessError:
+        logger.debug("_bulb_capture: epress2 not supported, trying bulb=1")
+        _run(
+            ["--set-config", "capturetarget=0", "--set-config", "bulb=1"],
+            check=True,
+        )
+        shutter_key = "bulb"
+        shutter_off = "bulb=0"
+
+    # Hold the shutter open for the requested duration.
+    time.sleep(duration)
+
+    # Close the shutter and download the resulting image.
+    result = _run(
+        [
+            "--set-config", shutter_off,
+            "--wait-event-and-download=10s",
+            "--filename",
+            "%Y%m%d-%H%M%S-%05n.%C",
+            "--force-overwrite",
+        ],
+        cwd=tmpdir,
+        check=True,
+    )
+    logger.debug(
+        "_bulb_capture: download stdout=%r stderr=%r",
+        (result.stdout or "").strip(),
+        (result.stderr or "").strip(),
+    )
 
 
 def _simulate_capture(gallery_path: Path) -> Path:

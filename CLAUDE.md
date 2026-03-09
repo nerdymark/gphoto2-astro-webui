@@ -78,6 +78,8 @@ Tests use `unittest.mock` to mock gphoto2 subprocess calls. Test file: `backend/
 - **Thread safety**: Camera access is serialized with `threading.RLock()` to prevent concurrent USB access
 - **USB conflict resolution**: Automatically kills gvfs daemons (gvfsd, gvfs-gphoto2-volume-monitor, gvfs-mtp-volume-monitor, gvfsd-fuse) and unmounts FUSE mounts before camera access
 - **Retry logic**: Auto-retries on USB claim errors (3 attempts) and PTP access denied errors (3 attempts)
+- **Bulb mode**: Camera detects Bulb/Time shutter-speed modes and uses the two-phase `epress2` (Nikon) or `bulb` (generic) capture sequence instead of `--capture-image-and-download`
+- **Config key fallbacks**: Nikon cameras use `f-number` instead of `aperture` and may use `shutterspeed2` instead of `shutterspeed`. The getter and setter both probe for the correct key.
 - **Path sanitization**: Gallery names are validated to allow only `[a-zA-Z0-9._\- ]`
 - **Pydantic models**: Used for request/response validation (`ExposureSettings`, `CaptureRequest`, `StackRequest`, `CreateGalleryRequest`)
 - **Image formats**: Supports .jpg, .jpeg, .png, .tif, .cr2, .nef, .arw
@@ -112,3 +114,22 @@ Tests use `unittest.mock` to mock gphoto2 subprocess calls. Test file: `backend/
 | DELETE | `/api/galleries/{name}/{file}` | Delete image |
 | POST | `/api/galleries/{name}/stack` | Stack selected images |
 | GET | `/api/images/{gallery}/{file}` | Serve image file |
+
+## Known Issues and Troubleshooting (Nikon D780)
+
+### "PTP Access Denied" or "PTP Session Already Opened"
+**Cause**: gvfs daemons (gvfs-mtp-volume-monitor, gvfsd-mtp) auto-claim the camera's PTP/MTP USB session. The D780 uses PTP/MTP as its only USB mode.
+**Fix**: The installer masks gvfs services, removes gvfs-backends, adds a udev rule with `GVFS_IGNORE=1`, and renames dbus service files. The capture code also kills gvfs proactively before each capture with retry logic.
+
+### "Invalid Status / Could not capture image"
+**Cause**: Camera is in Bulb mode (shutter speed = `0xFFFFFFFD`). Standard `--capture-image-and-download` sends a single InitiateCapture PTP command which Bulb mode rejects.
+**Fix**: `camera.py` detects Bulb mode via `is_bulb_mode()` and uses the `epress2=on` / `epress2=off` two-phase shutter sequence (Nikon-specific, falls back to `bulb=1`/`bulb=0` for other brands). Set a specific shutter speed (not Bulb) on the camera dial to avoid this entirely.
+
+### Slow USB communication in shell mode
+**Cause**: libgphoto2 PTP2 property cache timeout (5s default) causes excessive cache refreshes on cameras with many properties like the D780.
+**Workaround**: Add `ptp2=cachetime=10` to `~/.gphoto/settings`.
+
+### Config key differences
+- Nikon uses `f-number` not `aperture`
+- Nikon may use `shutterspeed2` not `shutterspeed`
+- The code probes for the correct key automatically in both getters and setters
