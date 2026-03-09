@@ -641,6 +641,151 @@ class TestCameraModule:
             f"(once per retry gap); got {mock_kill.call_count}"
         )
 
+    def test_run_retries_after_ptp_session_already_opened(self):
+        """When gphoto2 returns 'PTP Session Already Opened', _run kills gvfs and retries."""
+        import camera as cam
+
+        ptp_session_error = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="",
+            stderr="PTP Session Already Opened",
+        )
+        ok_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Camera OK", stderr="",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch("camera.subprocess.run", side_effect=[ptp_session_error, ok_result]) as mock_run,
+            patch.object(cam, "_kill_gvfs_monitor") as mock_kill,
+        ):
+            result = cam._run(["--summary"])
+
+        assert mock_kill.call_count == 1
+        assert mock_run.call_count == 2
+        assert result.returncode == 0
+        assert result.stdout == "Camera OK"
+
+    def test_run_gives_up_after_max_ptp_session_retries(self):
+        """After _USB_MAX_ATTEMPTS attempts with PTP Session Already Opened, _run stops and raises."""
+        import camera as cam
+
+        ptp_session_error = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="",
+            stderr="PTP Session Already Opened",
+        )
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch("camera.subprocess.run", return_value=ptp_session_error) as mock_run,
+            patch.object(cam, "_kill_gvfs_monitor") as mock_kill,
+        ):
+            with pytest.raises(subprocess.CalledProcessError):
+                cam._run(["--summary"])
+
+        assert mock_run.call_count == cam._USB_MAX_ATTEMPTS
+        assert mock_kill.call_count == cam._USB_MAX_ATTEMPTS - 1
+
+    def test_capture_image_ptp_session_already_opened_raises_with_detail(self, tmp_path):
+        """gphoto2 exits 0 with 'PTP Session Already Opened' in stderr: RuntimeError with detail.
+
+        This error (code 0x201e) means gvfs already holds the PTP session.
+        All retry attempts fail here to verify the final RuntimeError.
+        """
+        import camera as cam
+
+        ptp_session_stderr = (
+            "*** Error ***\n"
+            "PTP Session Already Opened\n"
+            "ERROR: Could not capture image.\n"
+            "ERROR: Could not capture."
+        )
+
+        def mock_run(args, check=True, cwd=None):
+            if "--capture-image-and-download" in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout="", stderr=ptp_session_stderr
+                )
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+            patch.object(cam, "_kill_gvfs_monitor"),
+        ):
+            with pytest.raises(RuntimeError, match="PTP Session Already Opened"):
+                cam.capture_image(tmp_path)
+
+    def test_capture_image_ptp_session_already_opened_retries_with_gvfs_kill(self, tmp_path):
+        """PTP Session Already Opened on first attempt: gvfs is killed and capture retries.
+
+        When gvfs holds the PTP session (0x201e), the retry mechanism must kill
+        those daemons between attempts so the next attempt can succeed.
+        """
+        import camera as cam
+
+        ptp_session_stderr = "*** Error ***\nPTP Session Already Opened\nERROR: Could not capture."
+        capture_call_count = 0
+
+        def mock_run(args, check=True, cwd=None):
+            nonlocal capture_call_count
+            if "--capture-image-and-download" in args:
+                capture_call_count += 1
+                if capture_call_count == 1:
+                    return subprocess.CompletedProcess(
+                        args=args, returncode=0, stdout="", stderr=ptp_session_stderr
+                    )
+                # Second attempt succeeds
+                if cwd:
+                    (Path(cwd) / "20240308-173422-00001.JPG").write_bytes(b"\xff\xd8fake")
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout="", stderr=""
+                )
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+            patch.object(cam, "_kill_gvfs_monitor") as mock_kill,
+        ):
+            result = cam.capture_image(tmp_path)
+
+        assert result.exists(), "capture_image must return a valid file path on retry"
+        assert capture_call_count == 2, "Expected exactly two capture attempts"
+        assert mock_kill.call_count == 1, (
+            "gvfs daemons must be killed exactly once between the failed and successful attempt"
+        )
+
+    def test_capture_image_ptp_session_already_opened_all_retries_kill_gvfs(self, tmp_path):
+        """Each PTP Session Already Opened attempt must kill gvfs before the next retry.
+
+        When all _PTP_MAX_ATTEMPTS fail with this error, gvfs must have been
+        killed (_PTP_MAX_ATTEMPTS - 1) times.
+        """
+        import camera as cam
+
+        ptp_session_stderr = "*** Error ***\nPTP Session Already Opened\nERROR: Could not capture."
+
+        def mock_run(args, check=True, cwd=None):
+            if "--capture-image-and-download" in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout="", stderr=ptp_session_stderr
+                )
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+            patch.object(cam, "_kill_gvfs_monitor") as mock_kill,
+        ):
+            with pytest.raises(RuntimeError, match="PTP Session Already Opened"):
+                cam.capture_image(tmp_path)
+
+        assert mock_kill.call_count == cam._PTP_MAX_ATTEMPTS - 1, (
+            f"Expected gvfs to be killed {cam._PTP_MAX_ATTEMPTS - 1} time(s) "
+            f"(once per retry gap); got {mock_kill.call_count}"
+        )
+
     def test_capture_image_could_not_capture_stderr_raises(self, tmp_path):
         """'ERROR: Could not capture' in stderr with exit 0 raises RuntimeError."""
         import camera as cam

@@ -33,6 +33,13 @@ _USB_MAX_ATTEMPTS = 3
 # session; retrying the capture after that usually succeeds.
 PTP_ACCESS_ERROR = "PTP Access Denied"
 
+# Substring present in gphoto2 stderr when the camera's PTP session is already
+# open (error code 0x201e).  This happens when gvfs has opened a PTP session
+# before gphoto2 starts – gphoto2 cannot open its own session on top of the
+# existing one.  Like PTP_ACCESS_ERROR, the fix is to kill the gvfs daemons
+# so that the competing session is closed before the next attempt.
+PTP_SESSION_ERROR = "PTP Session Already Opened"
+
 # Maximum number of capture attempts when a PTP access error is encountered.
 _PTP_MAX_ATTEMPTS = 3
 
@@ -71,7 +78,7 @@ def _kill_gvfs_monitor() -> None:
     process, so an unprivileged pkill is sufficient to terminate them.
     """
     logger.warning(
-        "USB device is claimed by another process; "
+        "USB device is claimed by another process (or a PTP session is already open); "
         "attempting to stop gvfsd, gvfs-gphoto2-volume-monitor, gvfsd-gphoto2, "
         "gvfs-mtp-volume-monitor, and gvfsd-mtp…"
     )
@@ -118,7 +125,9 @@ def _run(
                 (result.stdout or "").strip(),
                 (result.stderr or "").strip(),
             )
-            if USB_CLAIM_ERROR not in (result.stderr or "") or attempt >= _USB_MAX_ATTEMPTS - 1:
+            stderr_out = result.stderr or ""
+            device_conflict = USB_CLAIM_ERROR in stderr_out or PTP_SESSION_ERROR in stderr_out
+            if not device_conflict or attempt >= _USB_MAX_ATTEMPTS - 1:
                 break
             _kill_gvfs_monitor()
     if check and result.returncode != 0:
@@ -395,10 +404,14 @@ def capture_image(gallery_path: Path) -> Path:
                 # error to stderr.  Detect these patterns early so callers
                 # receive the real error rather than the generic "no file was
                 # downloaded" fallback.
-                if stderr_stripped and PTP_ACCESS_ERROR in stderr_stripped:
+                ptp_error = stderr_stripped and (
+                    PTP_ACCESS_ERROR in stderr_stripped
+                    or PTP_SESSION_ERROR in stderr_stripped
+                )
+                if ptp_error:
                     if attempt < _PTP_MAX_ATTEMPTS - 1:
                         logger.warning(
-                            "capture_image: PTP access denied (attempt %d/%d)"
+                            "capture_image: PTP access or session conflict (attempt %d/%d)"
                             " – killing gvfs camera daemons and retrying…",
                             attempt + 1,
                             _PTP_MAX_ATTEMPTS,

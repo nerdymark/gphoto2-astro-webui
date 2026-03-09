@@ -34,6 +34,10 @@ cd gphoto2-astro-webui
 chmod +x install.sh
 ./install.sh
 
+# If a previous version of this repo built gphoto2 from source you will be
+# prompted to remove it.  Pass --yes to skip the prompt and remove automatically.
+#   ./install.sh --yes
+
 # 3. Open a browser on any device on the same network
 #    The installer prints the URL at the end, e.g.:
 #    http://192.168.1.42
@@ -156,6 +160,7 @@ pytest tests/ -v
 |---|---|
 | "No camera" shown | Check USB cable; run `gphoto2 --auto-detect` |
 | Camera busy/locked | The app handles this automatically; for manual recovery run `pkill -f gvfsd-gphoto2` |
-| "PTP Access Denied" on capture | A gvfs daemon is holding the camera USB interface. Run `install.sh` to remove `gvfs-backends` and mask all gvfs volume monitors, or manually: `sudo apt-get remove -y gvfs-backends gvfs-fuse && pkill -f gvfsd` |
+| "PTP Access Denied" or "PTP Session Already Opened" on capture | A gvfs daemon is holding the camera's PTP session, or a source-built gphoto2 is mis-linked against the port library. Re-run `./install.sh` (add `--yes` to automatically remove any source-built version). For manual recovery: `sudo apt-get remove -y gvfs-backends gvfs-fuse && pkill -f gvfsd` |
+| Two gphoto2 binaries (`/usr/bin` and `/usr/local/bin`) | A previous install built gphoto2 from source. Run `./install.sh --yes` to remove the source build and switch to the distro package (`libgphoto2-port12t64` on Bookworm / `libgphoto2-port12` on Bullseye). |
 | Permission denied on USB | `sudo adduser $USER plugdev` then re-login |
 | Port 8000 in use | Change `--port` in the systemd service unit |
