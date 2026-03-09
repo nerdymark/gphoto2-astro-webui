@@ -28,6 +28,17 @@ export const captureImage = (gallery) =>
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ gallery }),
   });
+export const captureBurst = (gallery, count, interval = 0, bulbSeconds = null) =>
+  request("/api/camera/burst", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      gallery,
+      count,
+      interval,
+      ...(bulbSeconds != null && { bulb_seconds: bulbSeconds }),
+    }),
+  });
 
 // Galleries
 export const listGalleries = () => request("/api/galleries");

@@ -8,24 +8,36 @@ export default function CapturePanel({ gallery, onCapture }) {
   const [error, setError] = useState(null);
   const [burstCount, setBurstCount] = useState(1);
   const [burstInterval, setBurstInterval] = useState(5);
+  const [progress, setProgress] = useState(null);
 
   const doCapture = async () => {
     if (!gallery) return;
     setCapturing(true);
     setError(null);
+    setProgress(null);
     try {
-      for (let i = 0; i < burstCount; i++) {
-        if (i > 0) {
-          await new Promise((r) => setTimeout(r, burstInterval * 1000));
-        }
+      if (burstCount <= 1) {
         const result = await api.captureImage(gallery);
         setLastCapture(result);
         onCapture?.();
+      } else {
+        setProgress({ captured: 0, total: burstCount });
+        const result = await api.captureBurst(gallery, burstCount, burstInterval);
+        setProgress({ captured: result.captured, total: burstCount });
+        if (result.files && result.files.length > 0) {
+          const last = result.files[result.files.length - 1];
+          setLastCapture({ gallery, filename: last.filename });
+        }
+        onCapture?.();
+        if (result.captured < burstCount) {
+          setError(`Only ${result.captured} of ${burstCount} frames captured`);
+        }
       }
     } catch (err) {
       setError(err.message);
     } finally {
       setCapturing(false);
+      setProgress(null);
     }
   };
 
@@ -80,7 +92,9 @@ export default function CapturePanel({ gallery, onCapture }) {
             className="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 px-4 py-3 text-sm font-semibold text-white transition-colors"
           >
             {capturing
-              ? `Capturing${burstCount > 1 ? " (burst)…" : "…"}`
+              ? progress
+                ? `Capturing burst (${progress.captured}/${progress.total})…`
+                : "Capturing…"
               : burstCount > 1
               ? `Capture ${burstCount} Frames`
               : "Capture Image"}
