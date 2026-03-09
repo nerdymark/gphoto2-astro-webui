@@ -69,12 +69,13 @@ export const deleteImage = (gallery, filename) =>
     method: "DELETE",
   });
 
-// Stacking
+// Stacking (returns job_id – actual work happens in background)
 export const stackImages = (gallery, images, mode, outputName) =>
   request(`/api/galleries/${encodeURIComponent(gallery)}/stack`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ images, mode, output_name: outputName }),
+    timeout: 60000, // 60s – submit should be instant but GIL contention can delay response
   });
 
 // Jobs

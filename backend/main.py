@@ -144,7 +144,7 @@ def capture_image(req: CaptureRequest):
 
 
 @app.post("/api/camera/burst", status_code=202)
-def capture_burst(req: BurstRequest):
+async def capture_burst(req: BurstRequest):
     """Start a burst capture as a background job.
 
     Returns immediately with a job ID.  Poll ``GET /api/jobs/{id}``
@@ -260,7 +260,7 @@ def delete_image(gallery: str, filename: str):
 
 
 @app.post("/api/galleries/{gallery}/stack", status_code=202)
-def stack_gallery_images(gallery: str, req: StackRequest):
+async def stack_gallery_images(gallery: str, req: StackRequest):
     """Start image stacking as a background job.
 
     Returns immediately with a job ID.  Poll ``GET /api/jobs/{id}``
@@ -319,13 +319,13 @@ def stack_gallery_images(gallery: str, req: StackRequest):
 
 
 @app.get("/api/jobs")
-def list_jobs():
+async def list_jobs():
     """List all jobs (active and recent history)."""
     return {"jobs": jobs.list_all()}
 
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str):
+async def get_job(job_id: str):
     """Get the status of a specific job."""
     job = jobs.get(job_id)
     if not job:
@@ -334,7 +334,7 @@ def get_job(job_id: str):
 
 
 @app.post("/api/jobs/{job_id}/cancel")
-def cancel_job(job_id: str):
+async def cancel_job(job_id: str):
     """Request cancellation of a running job."""
     job = jobs.get(job_id)
     if not job:
