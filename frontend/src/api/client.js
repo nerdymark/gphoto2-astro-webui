@@ -75,8 +75,13 @@ export const stackImages = (gallery, images, mode, outputName) =>
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ images, mode, output_name: outputName }),
-    timeout: 600000, // 10 minutes – large stacks are slow on RPi
   });
+
+// Jobs
+export const getJob = (jobId) => request(`/api/jobs/${jobId}`);
+export const listJobs = () => request("/api/jobs");
+export const cancelJob = (jobId) =>
+  request(`/api/jobs/${jobId}/cancel`, { method: "POST" });
 
 export const imageUrl = (gallery, filename) =>
   `${BASE}/api/images/${encodeURIComponent(gallery)}/${encodeURIComponent(filename)}`;

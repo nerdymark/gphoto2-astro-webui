@@ -7,28 +7,33 @@ Endpoints:
   GET  /api/camera/exposure      – get current exposure settings + choices
   POST /api/camera/exposure      – set exposure settings
   POST /api/camera/capture       – capture one image into a gallery
+  POST /api/camera/burst         – start burst capture (returns job)
   GET  /api/galleries            – list galleries
   POST /api/galleries            – create a new gallery
   GET  /api/galleries/{gallery}  – list images in a gallery
-  POST /api/galleries/{gallery}/stack – stack images in a gallery
+  POST /api/galleries/{gallery}/stack – start stacking (returns job)
   GET  /api/images/{gallery}/{filename} – serve a gallery image
+  GET  /api/jobs                 – list all jobs
+  GET  /api/jobs/{job_id}        – get job status
+  POST /api/jobs/{job_id}/cancel – cancel a running job
 """
 
-import io
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import camera as cam
 import stacking as stk
+from jobs import jobs, JobStatus
 
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, _LOG_LEVEL, logging.INFO)
@@ -138,31 +143,58 @@ def capture_image(req: CaptureRequest):
     }
 
 
-@app.post("/api/camera/burst")
+@app.post("/api/camera/burst", status_code=202)
 def capture_burst(req: BurstRequest):
-    """Capture multiple frames in a single session (one gvfs kill + liveview)."""
+    """Start a burst capture as a background job.
+
+    Returns immediately with a job ID.  Poll ``GET /api/jobs/{id}``
+    for progress and results.
+    """
     if req.count < 1:
         raise HTTPException(status_code=400, detail="count must be >= 1")
     gallery_dir = _gallery_path(req.gallery)
-    try:
-        saved = cam.capture_burst(
-            gallery_dir,
-            count=req.count,
-            interval=req.interval,
-            bulb_seconds=req.bulb_seconds,
-        )
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {
-        "ok": True,
-        "gallery": req.gallery,
-        "captured": len(saved),
-        "requested": req.count,
-        "files": [
-            {"filename": p.name, "url": f"/api/images/{req.gallery}/{p.name}"}
-            for p in saved
-        ],
-    }
+    gallery_name = req.gallery
+
+    job = jobs.create(
+        "burst",
+        total=req.count,
+        message=f"Burst {req.count} frames into {gallery_name}",
+    )
+
+    def _run_burst():
+        jobs.start(job)
+        try:
+            def on_progress(frame_idx, total, saved_path):
+                jobs.update_progress(
+                    job,
+                    frame_idx + 1,
+                    f"Frame {frame_idx + 1}/{total}"
+                    + (f" saved {saved_path.name}" if saved_path else " FAILED"),
+                )
+
+            saved = cam.capture_burst(
+                gallery_dir,
+                count=req.count,
+                interval=req.interval,
+                bulb_seconds=req.bulb_seconds,
+                on_progress=on_progress,
+                cancel_check=lambda: job.cancelled,
+            )
+            jobs.complete(job, {
+                "ok": True,
+                "gallery": gallery_name,
+                "captured": len(saved),
+                "requested": req.count,
+                "files": [
+                    {"filename": p.name, "url": f"/api/images/{gallery_name}/{p.name}"}
+                    for p in saved
+                ],
+            })
+        except Exception as exc:
+            jobs.fail(job, str(exc))
+
+    threading.Thread(target=_run_burst, daemon=True).start()
+    return {"job_id": job.id}
 
 
 # ---------------------------------------------------------------------------
@@ -227,9 +259,15 @@ def delete_image(gallery: str, filename: str):
 # ---------------------------------------------------------------------------
 
 
-@app.post("/api/galleries/{gallery}/stack")
+@app.post("/api/galleries/{gallery}/stack", status_code=202)
 def stack_gallery_images(gallery: str, req: StackRequest):
+    """Start image stacking as a background job.
+
+    Returns immediately with a job ID.  Poll ``GET /api/jobs/{id}``
+    for progress and results.
+    """
     gallery_dir = _gallery_path(gallery)
+    gallery_name = gallery
 
     # Resolve filenames to paths and validate
     paths = []
@@ -242,23 +280,69 @@ def stack_gallery_images(gallery: str, req: StackRequest):
     if len(paths) < 2:
         raise HTTPException(status_code=400, detail="At least 2 images required for stacking")
 
-    try:
-        result_image = stk.stack_images(paths, mode=req.mode)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
     output_name = req.output_name or f"stacked-{req.mode}-{int(time.time())}.jpg"
-    output_path = gallery_dir / output_name
-    result_image.save(str(output_path), format="JPEG", quality=95)
+    mode = req.mode
 
-    return {
-        "ok": True,
-        "gallery": gallery,
-        "filename": output_name,
-        "url": f"/api/images/{gallery}/{output_name}",
-    }
+    job = jobs.create(
+        "stack",
+        total=len(paths),
+        message=f"Stacking {len(paths)} images ({mode})",
+    )
+
+    def _run_stack():
+        jobs.start(job)
+        try:
+            def on_progress(processed, total):
+                jobs.update_progress(
+                    job, processed, f"Processing image {processed}/{total}"
+                )
+
+            result_image = stk.stack_images(paths, mode=mode, on_progress=on_progress)
+            output_path = gallery_dir / output_name
+            result_image.save(str(output_path), format="JPEG", quality=95)
+            jobs.complete(job, {
+                "ok": True,
+                "gallery": gallery_name,
+                "filename": output_name,
+                "url": f"/api/images/{gallery_name}/{output_name}",
+            })
+        except Exception as exc:
+            jobs.fail(job, str(exc))
+
+    threading.Thread(target=_run_stack, daemon=True).start()
+    return {"job_id": job.id}
+
+
+# ---------------------------------------------------------------------------
+# Job tracking endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/jobs")
+def list_jobs():
+    """List all jobs (active and recent history)."""
+    return {"jobs": jobs.list_all()}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: str):
+    """Get the status of a specific job."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job.to_dict()
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    """Request cancellation of a running job."""
+    job = jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.status not in (JobStatus.queued, JobStatus.running):
+        raise HTTPException(status_code=400, detail=f"Cannot cancel job in state: {job.status.value}")
+    jobs.cancel(job)
+    return {"ok": True, "job_id": job_id}
 
 
 # ---------------------------------------------------------------------------

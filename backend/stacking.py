@@ -36,9 +36,13 @@ _MEDIAN_MEMORY_BUDGET = 200 * 1024 * 1024  # 200 MiB
 def stack_images(
     image_paths: list[Path],
     mode: StackMode = "mean",
+    on_progress=None,
 ) -> Image.Image:
     """
     Stack a list of images using the specified mode and return a PIL Image.
+
+    *on_progress* is an optional ``(images_processed, total_images)``
+    callback invoked after each image is accumulated.
     """
     try:
         import numpy as np
@@ -64,9 +68,9 @@ def stack_images(
     first.close()
 
     if mode in ("mean", "sum"):
-        return _stack_accumulate(image_paths, mode, reference_size, width, height, np)
+        return _stack_accumulate(image_paths, mode, reference_size, width, height, np, on_progress)
     else:
-        return _stack_median(image_paths, reference_size, width, height, np)
+        return _stack_median(image_paths, reference_size, width, height, np, on_progress)
 
 
 def _open_image(path: Path, reference_size):
@@ -83,7 +87,7 @@ def _open_image(path: Path, reference_size):
     return img
 
 
-def _stack_accumulate(image_paths, mode, reference_size, width, height, np):
+def _stack_accumulate(image_paths, mode, reference_size, width, height, np, on_progress=None):
     """Mean/sum stacking – single pass through all images.
 
     Opens each image exactly once, converts to a numpy uint8 array, and
@@ -112,15 +116,15 @@ def _stack_accumulate(image_paths, mode, reference_size, width, height, np):
     max_single_pass = 400 * 1024 * 1024
     if total_bytes <= max_single_pass:
         return _accumulate_single_pass(
-            image_paths, mode, reference_size, width, strip_ranges, n, np
+            image_paths, mode, reference_size, width, strip_ranges, n, np, on_progress
         )
     else:
         return _accumulate_multi_pass(
-            image_paths, mode, reference_size, width, height, strip_ranges, n, np
+            image_paths, mode, reference_size, width, height, strip_ranges, n, np, on_progress
         )
 
 
-def _accumulate_single_pass(image_paths, mode, reference_size, width, strip_ranges, n, np):
+def _accumulate_single_pass(image_paths, mode, reference_size, width, strip_ranges, n, np, on_progress=None):
     """Open each image once, accumulate all strips in memory."""
     # Pre-allocate all strip accumulators.
     accumulators = []
@@ -137,11 +141,13 @@ def _accumulate_single_pass(image_paths, mode, reference_size, width, strip_rang
         # Free the PIL image and numpy view promptly.
         img.close()
         del arr
+        if on_progress:
+            on_progress(idx + 1, n)
 
     return _finalize_accumulator(accumulators, mode, n, np)
 
 
-def _accumulate_multi_pass(image_paths, mode, reference_size, width, height, strip_ranges, n, np):
+def _accumulate_multi_pass(image_paths, mode, reference_size, width, height, strip_ranges, n, np, on_progress=None):
     """Process strips in batches, trading extra image opens for lower memory.
 
     Each pass processes enough strips to stay under ~200 MiB of accumulator
@@ -180,6 +186,8 @@ def _accumulate_multi_pass(image_paths, mode, reference_size, width, height, str
                 accumulators[i] += arr[y_start:y_end]
             img.close()
             del arr
+            if on_progress:
+                on_progress(idx + 1, n)
 
         all_results.extend(
             _finalize_strips(accumulators, mode, n, np)
@@ -226,7 +234,7 @@ def _finalize_accumulator(accumulators, mode, n, np):
     return Image.fromarray(result, mode="RGB")
 
 
-def _stack_median(image_paths, reference_size, width, height, np):
+def _stack_median(image_paths, reference_size, width, height, np, on_progress=None):
     """Median stacking with auto-scaled strip height.
 
     The strip height is chosen so that the per-strip array
@@ -262,6 +270,8 @@ def _stack_median(image_paths, reference_size, width, height, np):
             strip_img = img.crop((0, y_start, width, y_end))
             strips[i] = np.asarray(strip_img, dtype=np.uint8)
             img.close()
+            if on_progress:
+                on_progress(i + 1, n)
 
         median_strip = np.median(strips, axis=0)
         result_strips.append(np.clip(median_strip, 0, 255).astype(np.uint8))
