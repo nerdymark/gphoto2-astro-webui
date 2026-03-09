@@ -3,7 +3,7 @@ Lightweight in-memory job manager for long-running tasks.
 
 Jobs track burst captures and image stacking so the frontend can:
   1. Submit work and get an immediate job ID back (HTTP 202).
-  2. Poll ``GET /api/jobs/{id}`` for progress updates.
+  2. Poll ``GET /api/jobs/{id}`` for progress updates and log lines.
   3. See completed/failed jobs in ``GET /api/jobs``.
 
 Design constraints (Raspberry Pi):
@@ -17,14 +17,18 @@ import logging
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 # How many completed/failed jobs to keep for the frontend to query.
 _MAX_HISTORY = 50
+
+# Max log lines kept per job.
+_MAX_LOG_LINES = 200
 
 
 class JobStatus(str, Enum):
@@ -49,6 +53,7 @@ class Job:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     _cancel: threading.Event = field(default_factory=threading.Event)
+    _log: deque = field(default_factory=lambda: deque(maxlen=_MAX_LOG_LINES))
 
     @property
     def cancelled(self) -> bool:
@@ -57,7 +62,12 @@ class Job:
     def request_cancel(self):
         self._cancel.set()
 
-    def to_dict(self) -> dict:
+    def log(self, line: str):
+        """Append a timestamped log line."""
+        ts = time.strftime("%H:%M:%S")
+        self._log.append(f"[{ts}] {line}")
+
+    def to_dict(self, include_log: bool = False) -> dict:
         d = {
             "id": self.id,
             "type": self.type,
@@ -73,6 +83,8 @@ class Job:
             d["result"] = self.result
         if self.error is not None:
             d["error"] = self.error
+        if include_log:
+            d["log"] = list(self._log)
         return d
 
 
@@ -88,6 +100,7 @@ class JobManager:
             total=total,
             message=message,
         )
+        job.log(f"Job created: {message or job_type}")
         with self._lock:
             self._jobs[job.id] = job
             self._trim_history()
@@ -99,34 +112,41 @@ class JobManager:
 
     def list_all(self) -> list[dict]:
         with self._lock:
-            return [j.to_dict() for j in self._jobs.values()]
+            # Return newest first.
+            return [j.to_dict() for j in reversed(list(self._jobs.values()))]
 
     def start(self, job: Job):
         job.status = JobStatus.running
         job.started_at = time.time()
+        job.log("Started")
 
     def update_progress(self, job: Job, progress: int, message: str = ""):
         job.progress = progress
         if message:
             job.message = message
+            job.log(message)
 
     def complete(self, job: Job, result: dict):
         job.status = JobStatus.completed
         job.progress = job.total
         job.result = result
         job.finished_at = time.time()
-        logger.info("Job %s completed in %.1fs", job.id, job.finished_at - (job.started_at or job.created_at))
+        elapsed = job.finished_at - (job.started_at or job.created_at)
+        job.log(f"Completed in {elapsed:.1f}s")
+        logger.info("Job %s completed in %.1fs", job.id, elapsed)
 
     def fail(self, job: Job, error: str):
         job.status = JobStatus.failed
         job.error = error
         job.finished_at = time.time()
+        job.log(f"FAILED: {error}")
         logger.error("Job %s failed: %s", job.id, error)
 
     def cancel(self, job: Job):
         job.request_cancel()
         job.status = JobStatus.cancelled
         job.finished_at = time.time()
+        job.log("Cancelled by user")
         logger.info("Job %s cancelled", job.id)
 
     def _trim_history(self):
