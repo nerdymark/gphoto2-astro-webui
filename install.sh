@@ -331,6 +331,14 @@ do
         || true   # service may not be present on this system – that is fine
 done
 
+# Release the gvfs FUSE filesystem before killing gvfsd-fuse and gvfsd.
+# When gvfsd-fuse holds an active FUSE mount (visible as 'fuse ... 1' in
+# lsmod), gvfsd cannot exit cleanly until the mount is released.
+# fusermount -uz does a lazy unmount: the filesystem is detached from the
+# mount table immediately.  We try both common mount-point locations.
+fusermount -uz ~/.gvfs 2>/dev/null || true
+fusermount -uz "/run/user/$(id -u)/gvfs" 2>/dev/null || true
+
 # Kill all gvfs worker daemons that may currently hold the camera interface.
 for _pat in \
     gvfsd-gphoto2 \
@@ -416,6 +424,13 @@ ExecStartPre=-/usr/bin/pkill -f gvfsd-mtp
 ExecStartPre=-/usr/bin/pkill -f gvfs-udisks2-volume-monitor
 ExecStartPre=-/usr/bin/pkill -f gvfs-goa-volume-monitor
 ExecStartPre=-/usr/bin/pkill -f gvfs-afc-volume-monitor
+# Release the gvfs FUSE mount before killing gvfsd-fuse so gvfsd can exit.
+# fusermount -uz is a lazy unmount (detaches immediately without waiting).
+# %U is the systemd specifier for the service user's numeric UID;
+# %h is the specifier for the service user's home directory.
+# Both common mount-point paths are tried; failures are silently ignored.
+ExecStartPre=-/bin/fusermount -uz /run/user/%U/gvfs
+ExecStartPre=-/bin/fusermount -uz %h/.gvfs
 ExecStartPre=-/usr/bin/pkill -f gvfsd-fuse
 ExecStart=${REPO_DIR}/backend/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 --log-level \${LOG_LEVEL}
 Restart=on-failure

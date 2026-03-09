@@ -7,6 +7,7 @@ Falls back to a simulated camera when gphoto2 is not available (development mode
 
 import io
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
@@ -54,7 +55,7 @@ _camera_lock = threading.RLock()
 def _kill_gvfs_monitor() -> None:
     """Stop GNOME VFS processes that hold the camera's USB interface.
 
-    Four groups of cooperating GNOME VFS processes can claim a camera's USB
+    Five groups of cooperating GNOME VFS processes can claim a camera's USB
     interface, depending on how the camera presents itself to the OS:
 
     * gvfs-gphoto2-volume-monitor / gvfsd-gphoto2 – used when the camera is
@@ -64,6 +65,15 @@ def _kill_gvfs_monitor() -> None:
       USB mode, so the OS always sees them as MTP.  On Raspberry Pi OS Desktop
       gvfs-mtp-volume-monitor auto-starts at login and immediately claims the
       camera, making it the primary cause of "PTP Access Denied" errors.
+    * gvfsd-fuse – the GNOME VFS FUSE bridge daemon.  It provides a FUSE
+      filesystem (typically at ``~/.gvfs`` or ``/run/user/<uid>/gvfs``) that
+      maps gvfs virtual paths into the regular file system.  When this daemon
+      is running the ``fuse`` kernel module reports a non-zero use count
+      (``lsmod | grep fuse``).  **Crucially, gvfsd cannot exit cleanly while
+      gvfsd-fuse holds an active FUSE mount.**  The FUSE mount must be
+      released with ``fusermount -uz`` before gvfsd-fuse can be killed, and
+      only once gvfsd-fuse exits can gvfsd itself exit and stop restarting
+      the camera worker daemons.
     * gvfsd – the master GNOME VFS daemon.  It supervises all worker daemons
       and can restart them after they are killed.  Stopping gvfsd (or the
       gvfs-daemon user service) prevents automatic restarts that would
@@ -80,8 +90,36 @@ def _kill_gvfs_monitor() -> None:
     logger.warning(
         "USB device is claimed by another process (or a PTP session is already open); "
         "attempting to stop gvfsd, gvfs-gphoto2-volume-monitor, gvfsd-gphoto2, "
-        "gvfs-mtp-volume-monitor, and gvfsd-mtp…"
+        "gvfs-mtp-volume-monitor, gvfsd-mtp, and gvfsd-fuse…"
     )
+    # Release the gvfs FUSE mount before killing the daemons.  When
+    # gvfsd-fuse holds an active FUSE filesystem (e.g. ~/.gvfs or
+    # /run/user/<uid>/gvfs), gvfsd cannot exit cleanly until that mount is
+    # released.  fusermount -uz does a lazy unmount: the filesystem is
+    # detached from the mount table immediately without waiting for any
+    # ongoing file-system operations to complete.  Non-zero exits are logged
+    # at DEBUG level so unexpected failures (e.g. permission issues) remain
+    # visible in debug logs without being noisy in normal operation.
+    for mnt in (
+        os.path.expanduser("~/.gvfs"),
+        f"/run/user/{os.getuid()}/gvfs",
+    ):
+        try:
+            proc = subprocess.run(
+                ["fusermount", "-uz", mnt],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if proc.returncode != 0:
+                logger.debug(
+                    "_kill_gvfs_monitor: fusermount -uz %s exited %d: %s",
+                    mnt,
+                    proc.returncode,
+                    (proc.stderr or "").strip(),
+                )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            pass
     for cmd in (
         ["systemctl", "--user", "stop", "gvfs-gphoto2-volume-monitor"],
         ["pkill", "-f", "gvfs-gphoto2-volume-monitor"],
@@ -89,6 +127,9 @@ def _kill_gvfs_monitor() -> None:
         ["systemctl", "--user", "stop", "gvfs-mtp-volume-monitor"],
         ["pkill", "-f", "gvfs-mtp-volume-monitor"],
         ["pkill", "-f", "gvfsd-mtp"],
+        # gvfsd-fuse must be killed before gvfsd: once the FUSE mount is
+        # released (above), the daemon can exit promptly.
+        ["pkill", "-f", "gvfsd-fuse"],
         ["systemctl", "--user", "stop", "gvfs-daemon"],
         ["pkill", "-f", "gvfsd"],
     ):
@@ -372,6 +413,17 @@ def capture_image(gallery_path: Path) -> Path:
                     (ct.stderr or "").strip(),
                 )
             logger.debug("capture_image: starting capture into tmpdir=%s", tmpdir)
+            # Kill gvfs camera daemons proactively before the first capture
+            # attempt.  On cameras that use PTP/MTP as their only USB mode
+            # (e.g. Nikon D780), gvfs can (re)claim the PTP session in the
+            # window between is_camera_connected() returning True and the first
+            # --capture-image-and-download call.  The fuse kernel module
+            # reporting an active user (lsmod) confirms gvfsd-fuse is running;
+            # its FUSE mount keeps gvfsd alive and able to restart worker
+            # daemons.  Killing and unmounting here avoids that race on the
+            # first attempt; the retry loop below handles any subsequent
+            # conflicts.
+            _kill_gvfs_monitor()
             # Retry on PTP access errors.  On cameras like the Nikon D780 that
             # use PTP/MTP as their only USB mode, gvfs-mtp-volume-monitor
             # automatically opens an MTP session when the camera is connected.

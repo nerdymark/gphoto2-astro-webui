@@ -242,6 +242,119 @@ class TestCameraModule:
         assert "gvfs-mtp-volume-monitor" in log_messages
         assert "gvfsd" in log_messages
 
+    def test_kill_gvfs_monitor_kills_gvfsd_fuse(self):
+        """_kill_gvfs_monitor must target gvfsd-fuse to release the FUSE mount.
+
+        When the fuse kernel module has an active user (``lsmod`` shows
+        ``fuse ... 1``), gvfsd-fuse is running and holding a FUSE filesystem
+        mount.  This keeps gvfsd alive and able to restart camera worker
+        daemons even after they are killed.  gvfsd-fuse must be explicitly
+        killed to break that cycle.
+        """
+        import camera as cam
+
+        with (
+            patch("camera.subprocess.run") as mock_run,
+            patch("camera.time.sleep"),
+        ):
+            cam._kill_gvfs_monitor()
+
+        called_cmds = [call.args[0] for call in mock_run.call_args_list]
+        command_strings = [" ".join(cmd) for cmd in called_cmds]
+        assert any("gvfsd-fuse" in c for c in command_strings), (
+            "gvfsd-fuse was not targeted; it holds the FUSE mount that prevents "
+            "gvfsd from exiting and releasing the camera's PTP session"
+        )
+
+    def test_kill_gvfs_monitor_unmounts_gvfs_fuse(self):
+        """_kill_gvfs_monitor must call fusermount -uz to release the gvfs FUSE mount.
+
+        gvfsd cannot exit cleanly while gvfsd-fuse holds an active FUSE
+        mount.  A lazy unmount (``fusermount -uz``) detaches the filesystem
+        from the mount table immediately so that gvfsd-fuse can exit promptly
+        and gvfsd can then exit without restarting the camera daemons.
+        """
+        import camera as cam
+
+        with (
+            patch("camera.subprocess.run") as mock_run,
+            patch("camera.time.sleep"),
+        ):
+            cam._kill_gvfs_monitor()
+
+        called_cmds = [call.args[0] for call in mock_run.call_args_list]
+        command_strings = [" ".join(cmd) for cmd in called_cmds]
+        assert any("fusermount" in c and "-uz" in c for c in command_strings), (
+            "fusermount -uz was not called; the gvfs FUSE mount must be released "
+            "before gvfsd-fuse and gvfsd can exit and free the camera's PTP session"
+        )
+
+    def test_kill_gvfs_monitor_unmounts_before_killing(self):
+        """fusermount -uz must be called before pkill gvfsd-fuse.
+
+        The FUSE mount must be detached first so gvfsd-fuse is not blocked
+        waiting for it to be released when it receives SIGTERM.
+        """
+        import camera as cam
+
+        with (
+            patch("camera.subprocess.run") as mock_run,
+            patch("camera.time.sleep"),
+        ):
+            cam._kill_gvfs_monitor()
+
+        called_cmds = [call.args[0] for call in mock_run.call_args_list]
+        command_strings = [" ".join(cmd) for cmd in called_cmds]
+
+        fusermount_indices = [
+            i for i, c in enumerate(command_strings) if "fusermount" in c
+        ]
+        gvfsd_fuse_kill_indices = [
+            i for i, c in enumerate(command_strings)
+            if "gvfsd-fuse" in c and "fusermount" not in c
+        ]
+        assert fusermount_indices, "fusermount was never called"
+        assert gvfsd_fuse_kill_indices, "gvfsd-fuse was never killed"
+        assert max(fusermount_indices) < min(gvfsd_fuse_kill_indices), (
+            "fusermount must be called before pkill gvfsd-fuse so the FUSE "
+            "mount is detached before the daemon is killed"
+        )
+
+    def test_capture_image_kills_gvfs_before_first_attempt(self, tmp_path):
+        """capture_image must kill gvfs daemons before the first capture attempt.
+
+        On cameras like the Nikon D780, gvfs (via gvfsd-fuse + gvfsd-mtp) can
+        (re)claim the camera's PTP session between is_camera_connected()
+        returning True and the first --capture-image-and-download call.  A
+        proactive kill before the first attempt prevents this race.
+        """
+        import camera as cam
+
+        events: list[str] = []
+
+        def mock_run(args, check=True, cwd=None):
+            if "--capture-image-and-download" in args:
+                events.append("capture")
+                if cwd:
+                    (Path(cwd) / "20240308-173422-00001.JPG").write_bytes(b"\xff\xd8fake")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "is_camera_connected", return_value=True),
+            patch.object(cam, "_run", side_effect=mock_run),
+            patch.object(cam, "_kill_gvfs_monitor", side_effect=lambda: events.append("kill")),
+        ):
+            cam.capture_image(tmp_path)
+
+        first_capture_idx = next((i for i, e in enumerate(events) if e == "capture"), None)
+        assert first_capture_idx is not None, "No capture was attempted"
+        assert any(events[i] == "kill" for i in range(first_capture_idx)), (
+            "gvfs must be killed at least once before the first capture attempt; "
+            "gvfsd-fuse can (re)claim the camera between is_camera_connected() "
+            "and --capture-image-and-download"
+        )
+
     def test_run_gives_up_after_max_usb_retries(self):
         """After _USB_MAX_ATTEMPTS failed attempts, _run stops retrying and raises."""
         import camera as cam
@@ -572,8 +685,9 @@ class TestCameraModule:
 
         On cameras like the Nikon D780 that use PTP/MTP as their only USB mode,
         gvfs-gphoto2 opens a PTP session automatically when the camera is
-        connected.  The retry mechanism kills those daemons between attempts so
-        the second attempt can succeed.
+        connected.  capture_image now kills gvfs proactively before the first
+        attempt and again between the failed and successful attempt, so
+        mock_kill is called twice total (1 proactive + 1 retry).
         """
         import camera as cam
 
@@ -606,15 +720,21 @@ class TestCameraModule:
 
         assert result.exists(), "capture_image must return a valid file path on retry"
         assert capture_call_count == 2, "Expected exactly two capture attempts"
-        assert mock_kill.call_count == 1, (
-            "gvfs daemons must be killed exactly once between the failed and successful attempt"
+        # 1 proactive kill before first attempt + 1 kill between the failed and
+        # successful attempt = 2 total.
+        assert mock_kill.call_count == 2, (
+            "gvfs must be killed once proactively before the first attempt and "
+            "once between the failed and successful attempt (2 total); "
+            f"got {mock_kill.call_count}"
         )
 
     def test_capture_image_ptp_access_denied_all_retries_kill_gvfs(self, tmp_path):
         """Each PTP access denied attempt must kill gvfs before the next retry.
 
         When all _PTP_MAX_ATTEMPTS fail, gvfs must have been killed
-        (_PTP_MAX_ATTEMPTS - 1) times (once between each pair of attempts).
+        _PTP_MAX_ATTEMPTS times: once proactively before the first attempt and
+        once between each pair of subsequent attempts
+        (_PTP_MAX_ATTEMPTS - 1 retry gaps).
         """
         import camera as cam
 
@@ -636,9 +756,11 @@ class TestCameraModule:
             with pytest.raises(RuntimeError, match="PTP Access Denied"):
                 cam.capture_image(tmp_path)
 
-        assert mock_kill.call_count == cam._PTP_MAX_ATTEMPTS - 1, (
-            f"Expected gvfs to be killed {cam._PTP_MAX_ATTEMPTS - 1} time(s) "
-            f"(once per retry gap); got {mock_kill.call_count}"
+        # 1 proactive + (_PTP_MAX_ATTEMPTS - 1) retry gaps = _PTP_MAX_ATTEMPTS total.
+        assert mock_kill.call_count == cam._PTP_MAX_ATTEMPTS, (
+            f"Expected gvfs to be killed {cam._PTP_MAX_ATTEMPTS} time(s) "
+            f"(1 proactive + {cam._PTP_MAX_ATTEMPTS - 1} retry gap(s)); "
+            f"got {mock_kill.call_count}"
         )
 
     def test_run_retries_after_ptp_session_already_opened(self):
@@ -717,8 +839,10 @@ class TestCameraModule:
     def test_capture_image_ptp_session_already_opened_retries_with_gvfs_kill(self, tmp_path):
         """PTP Session Already Opened on first attempt: gvfs is killed and capture retries.
 
-        When gvfs holds the PTP session (0x201e), the retry mechanism must kill
-        those daemons between attempts so the next attempt can succeed.
+        When gvfs holds the PTP session (0x201e), capture_image kills gvfs
+        proactively before the first attempt and again between the failed and
+        successful attempt, so mock_kill is called twice total
+        (1 proactive + 1 retry).
         """
         import camera as cam
 
@@ -751,15 +875,20 @@ class TestCameraModule:
 
         assert result.exists(), "capture_image must return a valid file path on retry"
         assert capture_call_count == 2, "Expected exactly two capture attempts"
-        assert mock_kill.call_count == 1, (
-            "gvfs daemons must be killed exactly once between the failed and successful attempt"
+        # 1 proactive kill before first attempt + 1 kill between the failed and
+        # successful attempt = 2 total.
+        assert mock_kill.call_count == 2, (
+            "gvfs must be killed once proactively before the first attempt and "
+            "once between the failed and successful attempt (2 total); "
+            f"got {mock_kill.call_count}"
         )
 
     def test_capture_image_ptp_session_already_opened_all_retries_kill_gvfs(self, tmp_path):
         """Each PTP Session Already Opened attempt must kill gvfs before the next retry.
 
         When all _PTP_MAX_ATTEMPTS fail with this error, gvfs must have been
-        killed (_PTP_MAX_ATTEMPTS - 1) times.
+        killed _PTP_MAX_ATTEMPTS times: once proactively before the first
+        attempt and once per retry gap (_PTP_MAX_ATTEMPTS - 1).
         """
         import camera as cam
 
@@ -781,9 +910,11 @@ class TestCameraModule:
             with pytest.raises(RuntimeError, match="PTP Session Already Opened"):
                 cam.capture_image(tmp_path)
 
-        assert mock_kill.call_count == cam._PTP_MAX_ATTEMPTS - 1, (
-            f"Expected gvfs to be killed {cam._PTP_MAX_ATTEMPTS - 1} time(s) "
-            f"(once per retry gap); got {mock_kill.call_count}"
+        # 1 proactive + (_PTP_MAX_ATTEMPTS - 1) retry gaps = _PTP_MAX_ATTEMPTS total.
+        assert mock_kill.call_count == cam._PTP_MAX_ATTEMPTS, (
+            f"Expected gvfs to be killed {cam._PTP_MAX_ATTEMPTS} time(s) "
+            f"(1 proactive + {cam._PTP_MAX_ATTEMPTS - 1} retry gap(s)); "
+            f"got {mock_kill.call_count}"
         )
 
     def test_capture_image_could_not_capture_stderr_raises(self, tmp_path):
