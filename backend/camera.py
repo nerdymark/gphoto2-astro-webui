@@ -158,16 +158,21 @@ def _kill_gvfs_monitor() -> None:
                     exc,
                 )
                 break
+    # Mask the services so systemd won't restart them automatically.
+    # "mask" is stronger than "stop" — it symlinks the unit to /dev/null.
     for cmd in (
+        ["systemctl", "--user", "mask", "gvfs-gphoto2-volume-monitor"],
         ["systemctl", "--user", "stop", "gvfs-gphoto2-volume-monitor"],
         ["pkill", "-f", "gvfs-gphoto2-volume-monitor"],
         ["pkill", "-f", "gvfsd-gphoto2"],
+        ["systemctl", "--user", "mask", "gvfs-mtp-volume-monitor"],
         ["systemctl", "--user", "stop", "gvfs-mtp-volume-monitor"],
         ["pkill", "-f", "gvfs-mtp-volume-monitor"],
         ["pkill", "-f", "gvfsd-mtp"],
         # gvfsd-fuse must be killed before gvfsd: once the FUSE mount is
         # released (above), the daemon can exit promptly.
         ["pkill", "-f", "gvfsd-fuse"],
+        ["systemctl", "--user", "mask", "gvfs-daemon"],
         ["systemctl", "--user", "stop", "gvfs-daemon"],
         ["pkill", "-f", "gvfsd"],
     ):
@@ -575,6 +580,9 @@ def _do_capture(
             raise RuntimeError(f"Capture failed: {exc.stderr}") from exc
 
 
+_LIVEVIEW_MAX_ATTEMPTS = 3
+
+
 def _enable_liveview() -> None:
     """Enable Live View (viewfinder=1) and wait for the mirror to flip.
 
@@ -582,24 +590,57 @@ def _enable_liveview() -> None:
     Denied" unless the mirror is up / Live View is active.  The mirror flip
     takes about 1-2 seconds, so we issue viewfinder=1 in its own gphoto2
     invocation and wait before proceeding to the actual capture command.
+
+    Retries up to _LIVEVIEW_MAX_ATTEMPTS times if gvfs is interfering.
     """
     _kill_gvfs_monitor()
-    try:
-        _run(["--set-config", "viewfinder=1"], check=True)
-    except subprocess.CalledProcessError:
-        logger.debug("_enable_liveview: viewfinder config not supported, skipping")
-        return
-    # Give the camera time to raise the mirror and fully enter Live View.
-    time.sleep(2)
+    for attempt in range(_LIVEVIEW_MAX_ATTEMPTS):
+        try:
+            result = _run(
+                ["--set-config", "viewfinder=1"], check=False
+            )
+            stderr = (result.stderr or "").strip()
+            if result.returncode == 0:
+                logger.info("_enable_liveview: viewfinder=1 set successfully")
+                # Give the camera time to raise the mirror and enter Live View.
+                time.sleep(2)
+                return
+            # Check for PTP/USB conflicts that are worth retrying.
+            if (
+                PTP_ACCESS_ERROR in stderr
+                or PTP_SESSION_ERROR in stderr
+                or USB_CLAIM_ERROR in stderr
+            ):
+                logger.warning(
+                    "_enable_liveview: PTP/USB conflict setting viewfinder "
+                    "(attempt %d/%d) – killing gvfs and retrying",
+                    attempt + 1,
+                    _LIVEVIEW_MAX_ATTEMPTS,
+                )
+                _kill_gvfs_monitor()
+                continue
+            # Non-retryable error (e.g. camera doesn't support viewfinder).
+            logger.debug(
+                "_enable_liveview: viewfinder=1 failed (non-retryable): %s",
+                stderr,
+            )
+            return
+        except subprocess.CalledProcessError:
+            logger.debug(
+                "_enable_liveview: viewfinder config not supported, skipping"
+            )
+            return
+    logger.warning(
+        "_enable_liveview: failed to set viewfinder after %d attempts, "
+        "proceeding with capture anyway",
+        _LIVEVIEW_MAX_ATTEMPTS,
+    )
 
 
 def _normal_capture(tmpdir: str) -> None:
     """Standard capture-and-download with PTP retry logic."""
     _enable_liveview()
     for attempt in range(_PTP_MAX_ATTEMPTS):
-        # Kill gvfs proactively on every attempt – it can reclaim the USB
-        # interface between retries.
-        _kill_gvfs_monitor()
         result = _run(
             [
                 "--set-config", "capturetarget=0",
@@ -629,6 +670,7 @@ def _normal_capture(tmpdir: str) -> None:
                     attempt + 1,
                     _PTP_MAX_ATTEMPTS,
                 )
+                _kill_gvfs_monitor()
                 continue
             raise RuntimeError(f"Capture failed: {stderr_stripped}")
         if stderr_stripped and "ERROR: Could not capture" in stderr_stripped:
