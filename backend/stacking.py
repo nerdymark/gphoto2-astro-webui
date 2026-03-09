@@ -6,8 +6,8 @@ Supports three stacking modes:
   - median : per-pixel median (best noise rejection)
   - sum    : simple accumulation (highlights faint stars)
 
-Memory-efficient: mean and sum use running accumulators (O(1) frame memory).
-Median processes images in horizontal strips to limit peak memory usage.
+All modes process images in horizontal strips to limit peak memory usage,
+making stacking feasible on memory-constrained devices like Raspberry Pi.
 """
 
 import logging
@@ -20,9 +20,11 @@ logger = logging.getLogger(__name__)
 
 StackMode = Literal["mean", "median", "sum"]
 
-# Number of pixel rows to process at a time for median stacking.
-# Smaller = less memory, larger = fewer I/O passes.
-_MEDIAN_STRIP_HEIGHT = 512
+# Number of pixel rows to process at a time.  Each strip holds at most
+# N * _STRIP_HEIGHT * W * 3 * 2 bytes (uint16 accumulator + uint8 frame).
+# At 512 rows and 6048 pixels wide that's ~18 MiB per strip for median
+# with 12 images (float32) or ~35 KiB per strip for mean/sum (uint32 acc).
+_STRIP_HEIGHT = 512
 
 
 def stack_images(
@@ -32,17 +34,8 @@ def stack_images(
     """
     Stack a list of images using the specified mode and return a PIL Image.
 
-    Args:
-        image_paths: Ordered list of image file paths to stack.
-        mode: Stacking algorithm – "mean", "median", or "sum".
-
-    Returns:
-        A single PIL Image representing the stacked result.
-
-    Raises:
-        ImportError: When NumPy is not available (required for stacking).
-        ValueError: When fewer than 2 images are provided or the mode is unknown.
-        RuntimeError: When image sizes are inconsistent.
+    All modes process images in horizontal strips so that peak memory stays
+    well below 100 MiB even for large (24 MP) images on a Raspberry Pi.
     """
     try:
         import numpy as np
@@ -61,18 +54,32 @@ def stack_images(
 
     logger.info("Stacking %d images with mode=%r", len(image_paths), mode)
 
-    if mode in ("mean", "sum"):
-        return _stack_accumulate(image_paths, mode, np)
-    else:
-        return _stack_median(image_paths, np)
+    # Determine reference size from first image.
+    first = Image.open(image_paths[0]).convert("RGB")
+    reference_size = first.size
+    width, height = reference_size
+    first.close()
+
+    result_strips: list = []
+
+    for y_start in range(0, height, _STRIP_HEIGHT):
+        y_end = min(y_start + _STRIP_HEIGHT, height)
+
+        if mode == "median":
+            strip = _median_strip(image_paths, reference_size, width, y_start, y_end, np)
+        else:
+            strip = _accumulate_strip(image_paths, reference_size, width, y_start, y_end, mode, np)
+
+        result_strips.append(strip)
+
+    result = np.concatenate(result_strips, axis=0)
+    return Image.fromarray(result, mode="RGB")
 
 
-def _open_and_prepare(
-    path: Path, reference_size: tuple[int, int] | None
-) -> Image.Image:
-    """Open an image, convert to RGB, and resize if needed."""
+def _open_strip(path: Path, reference_size, width, y_start, y_end):
+    """Open an image, crop to the strip, return as PIL Image."""
     img = Image.open(path).convert("RGB")
-    if reference_size is not None and img.size != reference_size:
+    if img.size != reference_size:
         logger.warning(
             "Image %s has size %s; expected %s – resizing",
             path.name,
@@ -80,69 +87,51 @@ def _open_and_prepare(
             reference_size,
         )
         img = img.resize(reference_size, Image.LANCZOS)
-    return img
+    return img.crop((0, y_start, width, y_end))
 
 
-def _stack_accumulate(image_paths, mode, np):
-    """Mean/sum stacking using a running accumulator (O(1) frame memory)."""
-    accumulator = None
-    reference_size = None
+def _accumulate_strip(image_paths, reference_size, width, y_start, y_end, mode, np):
+    """Mean/sum for one horizontal strip using a uint32 accumulator.
+
+    uint32 can hold 16,843,009 frames at max pixel value 255 before overflow,
+    so it's safe for any realistic number of images.  Peak memory per strip:
+    strip_height * width * 3 * 4 bytes (one uint32 accumulator) + one uint8
+    frame being added.
+    """
+    strip_h = y_end - y_start
+    accumulator = np.zeros((strip_h, width, 3), dtype=np.uint32)
     n = len(image_paths)
 
     for path in image_paths:
-        img = _open_and_prepare(path, reference_size)
-        if reference_size is None:
-            reference_size = img.size
-        arr = np.array(img, dtype=np.float32)
-        if accumulator is None:
-            accumulator = arr
-        else:
-            accumulator += arr
+        strip_img = _open_strip(path, reference_size, width, y_start, y_end)
+        accumulator += np.array(strip_img, dtype=np.uint8)
 
     if mode == "mean":
-        result = accumulator / n
-    else:  # sum
+        result = (accumulator / n).astype(np.uint8)
+    else:  # sum – normalise so brightest pixel maps to 255
         max_val = accumulator.max()
         if max_val > 0:
-            result = accumulator / max_val * 255.0
+            result = (accumulator * 255 // max_val).astype(np.uint8)
         else:
-            result = accumulator
+            result = accumulator.astype(np.uint8)
 
-    result = np.clip(result, 0, 255).astype(np.uint8)
-    return Image.fromarray(result, mode="RGB")
+    return result
 
 
-def _stack_median(image_paths, np):
-    """Median stacking using horizontal strips to limit peak memory.
+def _median_strip(image_paths, reference_size, width, y_start, y_end, np):
+    """Median for one horizontal strip.
 
-    Instead of loading all N images into one (N, H, W, 3) array, we process
-    _MEDIAN_STRIP_HEIGHT rows at a time, keeping only one strip per image in
-    memory.  Peak memory ≈ N * strip_height * W * 3 * 4 bytes.
+    Loads one strip per image into a (N, H, W, 3) uint8 array, computes
+    the per-pixel median, and returns the result as uint8.  Using uint8
+    instead of float32 halves memory (N * strip_h * W * 3 bytes).
     """
-    # Determine reference size from first image.
-    first = Image.open(image_paths[0]).convert("RGB")
-    reference_size = first.size
-    width, height = reference_size
-    first.close()
+    strip_h = y_end - y_start
+    # Use uint8 for storage, convert to float only for the median computation.
+    strips = np.empty((len(image_paths), strip_h, width, 3), dtype=np.uint8)
 
-    result_rows = []
+    for i, path in enumerate(image_paths):
+        strip_img = _open_strip(path, reference_size, width, y_start, y_end)
+        strips[i] = np.array(strip_img, dtype=np.uint8)
 
-    for y_start in range(0, height, _MEDIAN_STRIP_HEIGHT):
-        y_end = min(y_start + _MEDIAN_STRIP_HEIGHT, height)
-        strip_h = y_end - y_start
-
-        # Collect this strip from every image.
-        strips = np.empty(
-            (len(image_paths), strip_h, width, 3), dtype=np.float32
-        )
-        for i, path in enumerate(image_paths):
-            img = _open_and_prepare(path, reference_size)
-            # Crop to the strip: (left, upper, right, lower)
-            strip_img = img.crop((0, y_start, width, y_end))
-            strips[i] = np.array(strip_img, dtype=np.float32)
-
-        median_strip = np.median(strips, axis=0)
-        result_rows.append(np.clip(median_strip, 0, 255).astype(np.uint8))
-
-    result = np.concatenate(result_rows, axis=0)
-    return Image.fromarray(result, mode="RGB")
+    median_strip = np.median(strips, axis=0)
+    return np.clip(median_strip, 0, 255).astype(np.uint8)

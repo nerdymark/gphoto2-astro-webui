@@ -241,7 +241,7 @@ def is_camera_connected() -> bool:
 
 
 def get_camera_summary() -> dict:
-    """Return basic camera info."""
+    """Return basic camera info including shooting mode and battery level."""
     global _cached_summary
 
     # While a capture is in progress, return cached data to avoid opening a
@@ -254,7 +254,17 @@ def get_camera_summary() -> dict:
         return {"connected": False, "model": "No camera", "summary": ""}
     try:
         result = _run(["--summary"])
-        summary = {"connected": True, "model": "", "summary": result.stdout}
+
+        # Batch-fetch status info in a single gphoto2 call to avoid
+        # multiple lock acquisitions and PTP round-trips on each status poll.
+        status_info = _get_status_configs()
+
+        summary = {
+            "connected": True,
+            "model": "",
+            "summary": result.stdout,
+            **status_info,
+        }
         _cached_summary = summary
         return summary
     except subprocess.CalledProcessError as exc:
@@ -316,6 +326,68 @@ def _get_config_choices(key: str) -> list[str]:
     except Exception as exc:
         logger.error("_get_config_choices(%r) unexpected error: %s", key, exc)
     return []
+
+
+# Keys to probe for status info.  Each entry is (output_field, [keys_to_try]).
+# The first key that returns a value wins.
+_STATUS_CONFIG_KEYS = [
+    ("shooting_mode", ["autoexposuremode", "expprogram"]),
+    ("focus_mode", ["focusmode2", "focusmode"]),
+    ("battery", ["batterylevel"]),
+]
+
+
+def _get_status_configs() -> dict:
+    """Fetch shooting mode, focus mode, and battery in one gphoto2 call.
+
+    Uses ``--get-config`` with multiple keys in a single invocation to
+    minimize PTP round-trips and lock contention.  Returns a dict with
+    keys ``shooting_mode``, ``focus_mode``, and ``battery`` (any may be None).
+    """
+    if not GPHOTO2_BIN:
+        return {field: None for field, _ in _STATUS_CONFIG_KEYS}
+
+    # Build a flat list of all candidate keys.
+    all_keys: list[str] = []
+    for _, candidates in _STATUS_CONFIG_KEYS:
+        all_keys.extend(candidates)
+
+    # gphoto2 --get-config key1 --get-config key2 ... prints each key's
+    # config block separated by "Label:" lines.  It exits 0 even when
+    # individual keys are missing (those print an error to stderr).
+    args: list[str] = []
+    for key in all_keys:
+        args.extend(["--get-config", key])
+
+    try:
+        result = _run(args, check=False)
+    except Exception as exc:
+        logger.error("_get_status_configs: %s", exc)
+        return {field: None for field, _ in _STATUS_CONFIG_KEYS}
+
+    # Parse the output: split into per-key blocks by "Label:" boundaries.
+    # Each block contains Label, Readonly, Type, Current, Choice lines.
+    key_values: dict[str, str] = {}
+    current_key_idx = -1
+    for line in (result.stdout or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Label:"):
+            current_key_idx += 1
+        elif stripped.startswith("Current:") and 0 <= current_key_idx < len(all_keys):
+            val = stripped.split(":", 1)[1].strip()
+            key_values[all_keys[current_key_idx]] = val
+
+    # Map to output fields: first candidate key with a value wins.
+    output: dict[str, Optional[str]] = {}
+    for field, candidates in _STATUS_CONFIG_KEYS:
+        output[field] = None
+        for key in candidates:
+            if key in key_values:
+                output[field] = key_values[key]
+                break
+
+    logger.debug("_get_status_configs: %s", output)
+    return output
 
 
 def _get_config(
