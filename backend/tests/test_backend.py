@@ -1439,6 +1439,7 @@ class TestAPI:
         assert len(resp.json()["images"]) == 1
 
     def test_stack_images(self, client, tmp_path):
+        import time
         from PIL import Image
         import main
         import camera as cam
@@ -1456,10 +1457,22 @@ class TestAPI:
             "/api/galleries/stack_test/stack",
             json={"images": ["img1.jpg", "img2.jpg"], "mode": "mean"},
         )
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["ok"] is True
-        stacked_path = gallery_dir / data["filename"]
+        assert resp.status_code == 202
+        job_id = resp.json()["job_id"]
+
+        # Poll until the background job completes.
+        for _ in range(30):
+            job_resp = client.get(f"/api/jobs/{job_id}")
+            assert job_resp.status_code == 200
+            job_data = job_resp.json()
+            if job_data["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.1)
+
+        assert job_data["status"] == "completed"
+        result = job_data["result"]
+        assert result["ok"] is True
+        stacked_path = gallery_dir / result["filename"]
         assert stacked_path.exists()
 
     def test_delete_image(self, client, tmp_path):

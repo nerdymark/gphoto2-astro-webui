@@ -625,6 +625,8 @@ def capture_burst(
     count: int = 1,
     interval: float = 0,
     bulb_seconds: Optional[int] = None,
+    on_progress=None,
+    cancel_check=None,
 ) -> list[Path]:
     """Capture *count* images into *gallery_path* in a single session.
 
@@ -636,12 +638,26 @@ def capture_burst(
     *interval* is the pause in seconds between the end of one capture and the
     start of the next (0 = back-to-back).
 
+    *on_progress* is an optional ``(frame_index, count, saved_path_or_None)``
+    callback invoked after each frame attempt.
+
+    *cancel_check* is an optional callable returning True if the burst should
+    stop early.
+
     Returns a list of saved file paths (one per successful frame).
     """
     gallery_path.mkdir(parents=True, exist_ok=True)
 
     if not GPHOTO2_BIN or not is_camera_connected():
-        return [_simulate_capture(gallery_path) for _ in range(count)]
+        results = []
+        for i in range(count):
+            if cancel_check and cancel_check():
+                break
+            p = _simulate_capture(gallery_path)
+            results.append(p)
+            if on_progress:
+                on_progress(i, count, p)
+        return results
 
     bulb = is_bulb_mode()
     if bulb:
@@ -650,9 +666,13 @@ def capture_burst(
     _capture_active.set()
     try:
         saved: list[Path] = []
+        errors: list[str] = []
         # Kill gvfs once at the start of the burst.
         _kill_gvfs_monitor()
         for i in range(count):
+            if cancel_check and cancel_check():
+                logger.info("capture_burst: cancelled after %d frames", i)
+                break
             if i > 0 and interval > 0:
                 time.sleep(interval)
             logger.info("capture_burst: frame %d/%d", i + 1, count)
@@ -663,8 +683,13 @@ def capture_burst(
             try:
                 path = _do_capture_frame(gallery_path, bulb, bulb_seconds)
                 saved.append(path)
+                if on_progress:
+                    on_progress(i, count, path)
             except RuntimeError as exc:
                 logger.error("capture_burst: frame %d failed: %s", i + 1, exc)
+                errors.append(f"Frame {i+1}: {exc}")
+                if on_progress:
+                    on_progress(i, count, None)
                 # Full recovery for the next frame.
                 _kill_gvfs_monitor()
         return saved

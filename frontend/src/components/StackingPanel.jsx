@@ -1,6 +1,33 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import * as api from "../api/client";
 import { imageUrl } from "../api/client";
+import { useJob } from "../hooks/useJob";
+
+function useElapsed(active) {
+  const [elapsed, setElapsed] = useState(0);
+  const startRef = useRef(null);
+  useEffect(() => {
+    if (!active) {
+      startRef.current = null;
+      return;
+    }
+    startRef.current = Date.now();
+    const id = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startRef.current) / 1000));
+    }, 1000);
+    return () => {
+      clearInterval(id);
+      setElapsed(0);
+    };
+  }, [active]);
+  return elapsed;
+}
+
+function formatElapsed(s) {
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
 
 export default function StackingPanel({ gallery, images, onStackComplete }) {
   const [selected, setSelected] = useState(new Set());
@@ -9,6 +36,19 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
   const [stacking, setStacking] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const elapsed = useElapsed(stacking);
+
+  const { job: stackJob, startJob } = useJob({
+    onComplete: (data) => {
+      setStacking(false);
+      setResult(data.result);
+      onStackComplete?.();
+    },
+    onFail: (data) => {
+      setStacking(false);
+      setError(data.error || data.status);
+    },
+  });
 
   // Filter out already-stacked images from selection candidates
   const stackableImages = images.filter((img) => !img.filename.startsWith("stacked-"));
@@ -31,17 +71,15 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
     setError(null);
     setResult(null);
     try {
-      const res = await api.stackImages(
+      const { job_id } = await api.stackImages(
         gallery,
         Array.from(selected),
         mode,
         outputName.trim() || undefined
       );
-      setResult(res);
-      onStackComplete?.();
+      startJob(job_id);
     } catch (err) {
       setError(err.message);
-    } finally {
       setStacking(false);
     }
   };
@@ -72,6 +110,7 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
           <div className="flex gap-2 items-center">
             <button
               onClick={selectAll}
+              disabled={stacking}
               className="text-xs text-indigo-400 hover:text-indigo-300"
             >
               Select all
@@ -79,6 +118,7 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
             <span className="text-slate-600">·</span>
             <button
               onClick={clearAll}
+              disabled={stacking}
               className="text-xs text-slate-400 hover:text-slate-300"
             >
               Clear
@@ -93,6 +133,7 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
               <li key={img.filename}>
                 <button
                   onClick={() => toggleImage(img.filename)}
+                  disabled={stacking}
                   className={`relative w-full aspect-square rounded overflow-hidden border-2 transition-all ${
                     selected.has(img.filename)
                       ? "border-indigo-500 opacity-100"
@@ -151,13 +192,29 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
             </div>
           </div>
 
+          {/* Progress bar for stacking */}
+          {stacking && stackJob && stackJob.total > 0 && (
+            <div className="space-y-1">
+              <div className="flex justify-between text-xs text-slate-400">
+                <span>{stackJob.message}</span>
+                <span>{stackJob.progress}/{stackJob.total} — {formatElapsed(elapsed)}</span>
+              </div>
+              <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-purple-500 rounded-full transition-all duration-300"
+                  style={{ width: `${(stackJob.progress / stackJob.total) * 100}%` }}
+                />
+              </div>
+            </div>
+          )}
+
           <button
             onClick={handleStack}
             disabled={stacking || selected.size < 2}
             className="w-full rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-50 px-4 py-2.5 text-sm font-semibold text-white transition-colors"
           >
             {stacking
-              ? "Stacking…"
+              ? `Stacking… ${formatElapsed(elapsed)}`
               : `Stack ${selected.size} Image${selected.size !== 1 ? "s" : ""}`}
           </button>
 
@@ -166,7 +223,7 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
           {result && (
             <div>
               <p className="text-green-400 text-xs mb-1">
-                ✓ Stacked image saved as <span className="font-mono">{result.filename}</span>
+                Stacked image saved as <span className="font-mono">{result.filename}</span>
               </p>
               <a
                 href={imageUrl(result.gallery, result.filename)}

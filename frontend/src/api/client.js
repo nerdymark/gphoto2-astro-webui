@@ -77,5 +77,11 @@ export const stackImages = (gallery, images, mode, outputName) =>
     body: JSON.stringify({ images, mode, output_name: outputName }),
   });
 
+// Jobs
+export const getJob = (jobId) => request(`/api/jobs/${jobId}`);
+export const listJobs = () => request("/api/jobs");
+export const cancelJob = (jobId) =>
+  request(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+
 export const imageUrl = (gallery, filename) =>
   `${BASE}/api/images/${encodeURIComponent(gallery)}/${encodeURIComponent(filename)}`;
