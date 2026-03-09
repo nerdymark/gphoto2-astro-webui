@@ -538,9 +538,13 @@ def capture_image(gallery_path: Path, bulb_seconds: Optional[int] = None) -> Pat
 def _normal_capture(tmpdir: str) -> None:
     """Standard capture-and-download with PTP retry logic."""
     for attempt in range(_PTP_MAX_ATTEMPTS):
-        # Set capturetarget in the same invocation so it persists.
+        # Enable Live View (viewfinder=1) before capture.  Cameras like the
+        # Nikon D780 reject PTP InitiateCapture with "Access Denied" unless the
+        # mirror is up / Live View is active.  Also set capturetarget in the
+        # same invocation so it persists.
         result = _run(
             [
+                "--set-config", "viewfinder=1",
                 "--set-config", "capturetarget=0",
                 "--capture-image-and-download",
                 "--filename",
@@ -599,11 +603,17 @@ def _bulb_capture(tmpdir: str, bulb_seconds: Optional[int] = None) -> None:
     duration = bulb_seconds if bulb_seconds is not None else _DEFAULT_BULB_SECONDS
     logger.info("_bulb_capture: exposing for %d seconds", duration)
 
+    # Enable Live View first – cameras like the Nikon D780 reject PTP capture
+    # commands unless the mirror is up / Live View is active.
     # Try Nikon-style epress2 first, then generic bulb.
     # Set capturetarget in the same call that opens the shutter.
     try:
         _run(
-            ["--set-config", "capturetarget=0", "--set-config", "epress2=on"],
+            [
+                "--set-config", "viewfinder=1",
+                "--set-config", "capturetarget=0",
+                "--set-config", "epress2=on",
+            ],
             check=True,
         )
         shutter_key = "epress2"
@@ -611,7 +621,11 @@ def _bulb_capture(tmpdir: str, bulb_seconds: Optional[int] = None) -> None:
     except subprocess.CalledProcessError:
         logger.debug("_bulb_capture: epress2 not supported, trying bulb=1")
         _run(
-            ["--set-config", "capturetarget=0", "--set-config", "bulb=1"],
+            [
+                "--set-config", "viewfinder=1",
+                "--set-config", "capturetarget=0",
+                "--set-config", "bulb=1",
+            ],
             check=True,
         )
         shutter_key = "bulb"
