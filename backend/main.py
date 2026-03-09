@@ -69,6 +69,7 @@ class ExposureSettings(BaseModel):
 
 class CaptureRequest(BaseModel):
     gallery: str
+    bulb_seconds: Optional[int] = None
 
 
 class StackRequest(BaseModel):
@@ -119,7 +120,7 @@ def set_exposure(settings: ExposureSettings):
 def capture_image(req: CaptureRequest):
     gallery_dir = _gallery_path(req.gallery)
     try:
-        saved = cam.capture_image(gallery_dir)
+        saved = cam.capture_image(gallery_dir, bulb_seconds=req.bulb_seconds)
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return {
