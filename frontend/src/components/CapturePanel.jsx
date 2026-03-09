@@ -1,7 +1,6 @@
 import { useState } from "react";
 import * as api from "../api/client";
 import { imageUrl } from "../api/client";
-import { useJob } from "../hooks/useJob";
 
 export default function CapturePanel({ gallery, onCapture }) {
   const [capturing, setCapturing] = useState(false);
@@ -9,56 +8,32 @@ export default function CapturePanel({ gallery, onCapture }) {
   const [error, setError] = useState(null);
   const [burstCount, setBurstCount] = useState(1);
   const [burstInterval, setBurstInterval] = useState(5);
-
-  const { job: burstJob, startJob, cancelJob } = useJob({
-    onComplete: (data) => {
-      setCapturing(false);
-      const files = data.result?.files;
-      if (files && files.length > 0) {
-        const last = files[files.length - 1];
-        setLastCapture({ gallery, filename: last.filename });
-      }
-      const captured = data.result?.captured ?? 0;
-      const requested = data.result?.requested ?? burstCount;
-      if (captured < requested) {
-        setError(`${captured} of ${requested} frames captured`);
-      }
-      onCapture?.();
-    },
-    onFail: (data) => {
-      setCapturing(false);
-      setError(data.error || data.status);
-      onCapture?.();
-    },
-  });
+  const [submittedJob, setSubmittedJob] = useState(null);
 
   const doCapture = async () => {
     if (!gallery) return;
     setCapturing(true);
     setError(null);
+    setSubmittedJob(null);
     try {
       if (burstCount <= 1) {
         const result = await api.captureImage(gallery);
         setLastCapture(result);
-        setCapturing(false);
         onCapture?.();
       } else {
-        // Burst returns a job ID – poll via useJob.
+        // Burst returns a job ID – track in Jobs tab.
         const { job_id } = await api.captureBurst(gallery, burstCount, burstInterval);
-        startJob(job_id);
+        setSubmittedJob(job_id);
+        onCapture?.();
       }
     } catch (err) {
       setError(err.message);
+    } finally {
       setCapturing(false);
     }
   };
 
-  const handleCancel = async () => {
-    await cancelJob();
-  };
-
   const isBurst = burstCount > 1;
-  const burstActive = capturing && isBurst && burstJob;
 
   return (
     <div className="rounded-xl bg-slate-800 border border-slate-700 p-4 space-y-4">
@@ -107,45 +82,23 @@ export default function CapturePanel({ gallery, onCapture }) {
             )}
           </div>
 
-          {/* Progress bar for burst */}
-          {burstActive && burstJob.total > 0 && (
-            <div className="space-y-1">
-              <div className="flex justify-between text-xs text-slate-400">
-                <span>{burstJob.message}</span>
-                <span>{burstJob.progress}/{burstJob.total}</span>
-              </div>
-              <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-emerald-500 rounded-full transition-all duration-300"
-                  style={{ width: `${(burstJob.progress / burstJob.total) * 100}%` }}
-                />
-              </div>
-            </div>
-          )}
+          <button
+            onClick={doCapture}
+            disabled={capturing}
+            className="w-full rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 px-4 py-3 text-sm font-semibold text-white transition-colors"
+          >
+            {capturing
+              ? isBurst ? "Submitting burst…" : "Capturing…"
+              : isBurst
+              ? `Capture ${burstCount} Frames`
+              : "Capture Image"}
+          </button>
 
-          <div className="flex gap-2">
-            <button
-              onClick={doCapture}
-              disabled={capturing}
-              className="flex-1 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 px-4 py-3 text-sm font-semibold text-white transition-colors"
-            >
-              {capturing
-                ? burstActive
-                  ? `Capturing ${burstJob.progress}/${burstJob.total}…`
-                  : "Capturing…"
-                : isBurst
-                ? `Capture ${burstCount} Frames`
-                : "Capture Image"}
-            </button>
-            {burstActive && (
-              <button
-                onClick={handleCancel}
-                className="rounded-lg bg-red-700 hover:bg-red-600 px-4 py-3 text-sm font-semibold text-white transition-colors"
-              >
-                Cancel
-              </button>
-            )}
-          </div>
+          {submittedJob && (
+            <p className="text-blue-400 text-xs">
+              Burst job submitted (id: <span className="font-mono">{submittedJob}</span>). Check the Jobs tab for progress.
+            </p>
+          )}
 
           {error && <p className="text-red-400 text-xs">{error}</p>}
 

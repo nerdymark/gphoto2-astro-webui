@@ -14,7 +14,7 @@ Endpoints:
   POST /api/galleries/{gallery}/stack – start stacking (returns job)
   GET  /api/images/{gallery}/{filename} – serve a gallery image
   GET  /api/jobs                 – list all jobs
-  GET  /api/jobs/{job_id}        – get job status
+  GET  /api/jobs/{job_id}        – get job status + log
   POST /api/jobs/{job_id}/cancel – cancel a running job
 """
 
@@ -27,7 +27,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -37,9 +37,6 @@ from jobs import jobs, JobStatus
 
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, _LOG_LEVEL, logging.INFO)
-# basicConfig configures the root logger when no handlers exist yet (standalone run).
-# root.setLevel ensures the level is always applied even when uvicorn has already
-# configured the root logger's handlers before this module is imported.
 logging.basicConfig(level=_level)
 logging.root.setLevel(_level)
 logger = logging.getLogger(__name__)
@@ -147,12 +144,10 @@ def capture_image(req: CaptureRequest):
 async def capture_burst(req: BurstRequest):
     """Start a burst capture as a background job.
 
-    Returns immediately with a job ID.  Poll ``GET /api/jobs/{id}``
-    for progress and results.
+    Returns 202 immediately with a job ID.
     """
     if req.count < 1:
         raise HTTPException(status_code=400, detail="count must be >= 1")
-    gallery_dir = _gallery_path(req.gallery)
     gallery_name = req.gallery
 
     job = jobs.create(
@@ -164,13 +159,14 @@ async def capture_burst(req: BurstRequest):
     def _run_burst():
         jobs.start(job)
         try:
+            gallery_dir = _resolve_gallery(gallery_name)
+            if gallery_dir is None:
+                raise ValueError(f"Gallery '{gallery_name}' not found")
+
             def on_progress(frame_idx, total, saved_path):
-                jobs.update_progress(
-                    job,
-                    frame_idx + 1,
-                    f"Frame {frame_idx + 1}/{total}"
-                    + (f" saved {saved_path.name}" if saved_path else " FAILED"),
-                )
+                msg = (f"Frame {frame_idx + 1}/{total}"
+                       + (f" saved {saved_path.name}" if saved_path else " FAILED"))
+                jobs.update_progress(job, frame_idx + 1, msg)
 
             saved = cam.capture_burst(
                 gallery_dir,
@@ -263,35 +259,41 @@ def delete_image(gallery: str, filename: str):
 async def stack_gallery_images(gallery: str, req: StackRequest):
     """Start image stacking as a background job.
 
-    Returns immediately with a job ID.  Poll ``GET /api/jobs/{id}``
-    for progress and results.
+    Returns 202 immediately with a job ID.  All validation and processing
+    happens in the background thread so this never blocks.
     """
-    gallery_dir = _gallery_path(gallery)
     gallery_name = gallery
-
-    # Resolve filenames to paths and validate
-    paths = []
-    for fn in req.images:
-        p = gallery_dir / fn
-        if not p.exists():
-            raise HTTPException(status_code=404, detail=f"Image not found: {fn}")
-        paths.append(p)
-
-    if len(paths) < 2:
-        raise HTTPException(status_code=400, detail="At least 2 images required for stacking")
-
-    output_name = req.output_name or f"stacked-{req.mode}-{int(time.time())}.jpg"
+    image_filenames = list(req.images)
     mode = req.mode
+    output_name = req.output_name or f"stacked-{mode}-{int(time.time())}.jpg"
 
     job = jobs.create(
         "stack",
-        total=len(paths),
-        message=f"Stacking {len(paths)} images ({mode})",
+        total=len(image_filenames),
+        message=f"Stacking {len(image_filenames)} images ({mode})",
     )
 
     def _run_stack():
         jobs.start(job)
         try:
+            # Validate gallery exists.
+            gallery_dir = _resolve_gallery(gallery_name)
+            if gallery_dir is None:
+                raise ValueError(f"Gallery '{gallery_name}' not found")
+
+            # Validate image files exist.
+            paths = []
+            for fn in image_filenames:
+                p = gallery_dir / fn
+                if not p.exists():
+                    raise FileNotFoundError(f"Image not found: {fn}")
+                paths.append(p)
+
+            if len(paths) < 2:
+                raise ValueError("At least 2 images required for stacking")
+
+            job.log(f"Validated {len(paths)} images, starting {mode} stack")
+
             def on_progress(processed, total):
                 jobs.update_progress(
                     job, processed, f"Processing image {processed}/{total}"
@@ -299,6 +301,7 @@ async def stack_gallery_images(gallery: str, req: StackRequest):
 
             result_image = stk.stack_images(paths, mode=mode, on_progress=on_progress)
             output_path = gallery_dir / output_name
+            job.log(f"Saving result to {output_name}")
             result_image.save(str(output_path), format="JPEG", quality=95)
             jobs.complete(job, {
                 "ok": True,
@@ -326,11 +329,11 @@ async def list_jobs():
 
 @app.get("/api/jobs/{job_id}")
 async def get_job(job_id: str):
-    """Get the status of a specific job."""
+    """Get the status of a specific job including its log."""
     job = jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    return job.to_dict()
+    return job.to_dict(include_log=True)
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -372,6 +375,7 @@ if _DIST.exists():
 
 
 def _gallery_path(name: str) -> Path:
+    """Resolve and validate a gallery name.  Raises HTTPException on failure."""
     safe = "".join(c for c in name if c.isalnum() or c in "._- ").strip()
     if not safe:
         raise HTTPException(status_code=400, detail="Invalid gallery name")
@@ -379,6 +383,19 @@ def _gallery_path(name: str) -> Path:
     if not p.exists():
         raise HTTPException(status_code=404, detail=f"Gallery '{safe}' not found")
     return p
+
+
+def _resolve_gallery(name: str) -> Optional[Path]:
+    """Resolve a gallery name to a path, returning None if it doesn't exist.
+
+    Unlike _gallery_path this does NOT raise HTTPException – it's safe
+    to call from background threads where there's no request context.
+    """
+    safe = "".join(c for c in name if c.isalnum() or c in "._- ").strip()
+    if not safe:
+        return None
+    p = GALLERY_ROOT / safe
+    return p if p.exists() else None
 
 
 def _list_images(directory: Path) -> list[str]:
