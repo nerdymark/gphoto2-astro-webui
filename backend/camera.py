@@ -95,31 +95,48 @@ def _kill_gvfs_monitor() -> None:
     # Release the gvfs FUSE mount before killing the daemons.  When
     # gvfsd-fuse holds an active FUSE filesystem (e.g. ~/.gvfs or
     # /run/user/<uid>/gvfs), gvfsd cannot exit cleanly until that mount is
-    # released.  fusermount -uz does a lazy unmount: the filesystem is
-    # detached from the mount table immediately without waiting for any
-    # ongoing file-system operations to complete.  Non-zero exits are logged
-    # at DEBUG level so unexpected failures (e.g. permission issues) remain
-    # visible in debug logs without being noisy in normal operation.
+    # released.
+    #
+    # ``fusermount -uz`` is preferred: it is the FUSE-native lazy unmount and
+    # works without root privileges for user-owned FUSE mounts.  When the
+    # ``fusermount`` binary is absent (i.e. the ``fuse`` / ``fuse3`` package is
+    # not installed), ``umount -l`` is tried as a fallback – it is part of
+    # ``util-linux`` and available on virtually every Linux system.  Both
+    # perform a lazy detach: the filesystem is removed from the mount table
+    # immediately so gvfsd-fuse can exit promptly.  Non-zero exits are logged
+    # at DEBUG level.
     for mnt in (
         os.path.expanduser("~/.gvfs"),
         f"/run/user/{os.getuid()}/gvfs",
     ):
-        try:
-            proc = subprocess.run(
-                ["fusermount", "-uz", mnt],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if proc.returncode != 0:
-                logger.debug(
-                    "_kill_gvfs_monitor: fusermount -uz %s exited %d: %s",
-                    mnt,
-                    proc.returncode,
-                    (proc.stderr or "").strip(),
+        for unmount_cmd in (
+            ["fusermount", "-uz", mnt],
+            ["umount", "-l", mnt],
+        ):
+            try:
+                proc = subprocess.run(
+                    unmount_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
-        except (FileNotFoundError, subprocess.SubprocessError):
-            pass
+                if proc.returncode != 0:
+                    logger.debug(
+                        "_kill_gvfs_monitor: %s exited %d: %s",
+                        " ".join(unmount_cmd),
+                        proc.returncode,
+                        (proc.stderr or "").strip(),
+                    )
+                break  # command was found and run (success or non-zero exit)
+            except FileNotFoundError:
+                continue  # binary not installed – try the next fallback
+            except subprocess.SubprocessError as exc:
+                logger.debug(
+                    "_kill_gvfs_monitor: %s failed: %s",
+                    " ".join(unmount_cmd),
+                    exc,
+                )
+                break
     for cmd in (
         ["systemctl", "--user", "stop", "gvfs-gphoto2-volume-monitor"],
         ["pkill", "-f", "gvfs-gphoto2-volume-monitor"],
@@ -261,7 +278,9 @@ def _get_config_choices(key: str) -> list[str]:
     return []
 
 
-def _get_config(key: str) -> tuple[Optional[str], list[str]]:
+def _get_config(
+    key: str, warn_if_missing: bool = True
+) -> tuple[Optional[str], list[str]]:
     """Return ``(current_value, choices)`` for a camera config key.
 
     Both the current value and the list of choices are parsed from a **single**
@@ -271,6 +290,11 @@ def _get_config(key: str) -> tuple[Optional[str], list[str]]:
 
     Returns ``(None, [])`` when the key is not in the camera's config tree or
     gphoto2 is unavailable.
+
+    *warn_if_missing* controls the log level used when the key is absent from
+    the camera's config tree.  Pass ``False`` when a fallback key will be tried
+    so that the "not supported" message is demoted to DEBUG and does not clutter
+    production logs (e.g. ``aperture`` → ``f-number`` on Nikon bodies).
     """
     if not GPHOTO2_BIN:
         return None, []
@@ -292,7 +316,13 @@ def _get_config(key: str) -> tuple[Optional[str], list[str]]:
     except subprocess.CalledProcessError as exc:
         msg = (exc.stderr or "").strip() or (exc.stdout or "").strip()
         if "not found in configuration tree" in msg:
-            logger.warning("_get_config(%r): key not supported by this camera", key)
+            if warn_if_missing:
+                logger.warning("_get_config(%r): key not supported by this camera", key)
+            else:
+                logger.debug(
+                    "_get_config(%r): key not supported by this camera (trying fallback)",
+                    key,
+                )
         else:
             logger.error(
                 "_get_config(%r) failed (exit %d): %s",
@@ -343,11 +373,11 @@ def get_exposure_settings() -> dict:
     separate calls for value and choices when the first key fails, reducing the
     number of subprocess invocations and the time the camera lock is held.
     """
-    aperture, aperture_choices = _get_config("aperture")
+    aperture, aperture_choices = _get_config("aperture", warn_if_missing=False)
     if aperture is None and not aperture_choices:
         aperture, aperture_choices = _get_config("f-number")
 
-    shutter, shutter_choices = _get_config("shutterspeed")
+    shutter, shutter_choices = _get_config("shutterspeed", warn_if_missing=False)
     if shutter is None and not shutter_choices:
         shutter, shutter_choices = _get_config("shutterspeed2")
 
