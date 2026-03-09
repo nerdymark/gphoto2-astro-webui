@@ -550,12 +550,6 @@ def _do_capture(
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
             logger.debug("capture_image: starting capture into tmpdir=%s", tmpdir)
-            # Kill gvfs camera daemons proactively before the first capture
-            # attempt.  On cameras that use PTP/MTP as their only USB mode
-            # (e.g. Nikon D780), gvfs can (re)claim the PTP session in the
-            # window between is_camera_connected() returning True and the first
-            # capture call.
-            _kill_gvfs_monitor()
 
             if bulb:
                 _bulb_capture(tmpdir, bulb_seconds)
@@ -581,16 +575,33 @@ def _do_capture(
             raise RuntimeError(f"Capture failed: {exc.stderr}") from exc
 
 
+def _enable_liveview() -> None:
+    """Enable Live View (viewfinder=1) and wait for the mirror to flip.
+
+    Cameras like the Nikon D780 reject PTP InitiateCapture with "Access
+    Denied" unless the mirror is up / Live View is active.  The mirror flip
+    takes about 1-2 seconds, so we issue viewfinder=1 in its own gphoto2
+    invocation and wait before proceeding to the actual capture command.
+    """
+    _kill_gvfs_monitor()
+    try:
+        _run(["--set-config", "viewfinder=1"], check=True)
+    except subprocess.CalledProcessError:
+        logger.debug("_enable_liveview: viewfinder config not supported, skipping")
+        return
+    # Give the camera time to raise the mirror and fully enter Live View.
+    time.sleep(2)
+
+
 def _normal_capture(tmpdir: str) -> None:
     """Standard capture-and-download with PTP retry logic."""
+    _enable_liveview()
     for attempt in range(_PTP_MAX_ATTEMPTS):
-        # Enable Live View (viewfinder=1) before capture.  Cameras like the
-        # Nikon D780 reject PTP InitiateCapture with "Access Denied" unless the
-        # mirror is up / Live View is active.  Also set capturetarget in the
-        # same invocation so it persists.
+        # Kill gvfs proactively on every attempt – it can reclaim the USB
+        # interface between retries.
+        _kill_gvfs_monitor()
         result = _run(
             [
-                "--set-config", "viewfinder=1",
                 "--set-config", "capturetarget=0",
                 "--capture-image-and-download",
                 "--filename",
@@ -618,7 +629,6 @@ def _normal_capture(tmpdir: str) -> None:
                     attempt + 1,
                     _PTP_MAX_ATTEMPTS,
                 )
-                _kill_gvfs_monitor()
                 continue
             raise RuntimeError(f"Capture failed: {stderr_stripped}")
         if stderr_stripped and "ERROR: Could not capture" in stderr_stripped:
@@ -651,12 +661,13 @@ def _bulb_capture(tmpdir: str, bulb_seconds: Optional[int] = None) -> None:
 
     # Enable Live View first – cameras like the Nikon D780 reject PTP capture
     # commands unless the mirror is up / Live View is active.
+    _enable_liveview()
+
     # Try Nikon-style epress2 first, then generic bulb.
     # Set capturetarget in the same call that opens the shutter.
     try:
         _run(
             [
-                "--set-config", "viewfinder=1",
                 "--set-config", "capturetarget=0",
                 "--set-config", "epress2=on",
             ],
@@ -668,7 +679,6 @@ def _bulb_capture(tmpdir: str, bulb_seconds: Optional[int] = None) -> None:
         logger.debug("_bulb_capture: epress2 not supported, trying bulb=1")
         _run(
             [
-                "--set-config", "viewfinder=1",
                 "--set-config", "capturetarget=0",
                 "--set-config", "bulb=1",
             ],

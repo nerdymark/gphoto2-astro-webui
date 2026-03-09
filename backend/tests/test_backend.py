@@ -835,21 +835,18 @@ class TestCameraModule:
 
         assert result.exists(), "capture_image must return a valid file path on retry"
         assert capture_call_count == 2, "Expected exactly two capture attempts"
-        # 1 proactive kill before first attempt + 1 kill between the failed and
-        # successful attempt = 2 total.
-        assert mock_kill.call_count == 2, (
-            "gvfs must be killed once proactively before the first attempt and "
-            "once between the failed and successful attempt (2 total); "
-            f"got {mock_kill.call_count}"
+        # 1 kill in _enable_liveview + 2 kills in the loop (one per attempt) = 3.
+        assert mock_kill.call_count == 3, (
+            "gvfs must be killed once in _enable_liveview and once per capture "
+            f"attempt (1 + 2 = 3 total); got {mock_kill.call_count}"
         )
 
     def test_capture_image_ptp_access_denied_all_retries_kill_gvfs(self, tmp_path):
         """Each PTP access denied attempt must kill gvfs before the next retry.
 
         When all _PTP_MAX_ATTEMPTS fail, gvfs must have been killed
-        _PTP_MAX_ATTEMPTS times: once proactively before the first attempt and
-        once between each pair of subsequent attempts
-        (_PTP_MAX_ATTEMPTS - 1 retry gaps).
+        1 (from _enable_liveview) + _PTP_MAX_ATTEMPTS (one per loop iteration)
+        times total.
         """
         import camera as cam
 
@@ -871,10 +868,11 @@ class TestCameraModule:
             with pytest.raises(RuntimeError, match="PTP Access Denied"):
                 cam.capture_image(tmp_path)
 
-        # 1 proactive + (_PTP_MAX_ATTEMPTS - 1) retry gaps = _PTP_MAX_ATTEMPTS total.
-        assert mock_kill.call_count == cam._PTP_MAX_ATTEMPTS, (
-            f"Expected gvfs to be killed {cam._PTP_MAX_ATTEMPTS} time(s) "
-            f"(1 proactive + {cam._PTP_MAX_ATTEMPTS - 1} retry gap(s)); "
+        # 1 from _enable_liveview + _PTP_MAX_ATTEMPTS from the loop.
+        expected = 1 + cam._PTP_MAX_ATTEMPTS
+        assert mock_kill.call_count == expected, (
+            f"Expected gvfs to be killed {expected} time(s) "
+            f"(1 liveview + {cam._PTP_MAX_ATTEMPTS} loop); "
             f"got {mock_kill.call_count}"
         )
 
@@ -990,20 +988,18 @@ class TestCameraModule:
 
         assert result.exists(), "capture_image must return a valid file path on retry"
         assert capture_call_count == 2, "Expected exactly two capture attempts"
-        # 1 proactive kill before first attempt + 1 kill between the failed and
-        # successful attempt = 2 total.
-        assert mock_kill.call_count == 2, (
-            "gvfs must be killed once proactively before the first attempt and "
-            "once between the failed and successful attempt (2 total); "
-            f"got {mock_kill.call_count}"
+        # 1 kill in _enable_liveview + 2 kills in the loop (one per attempt) = 3.
+        assert mock_kill.call_count == 3, (
+            "gvfs must be killed once in _enable_liveview and once per capture "
+            f"attempt (1 + 2 = 3 total); got {mock_kill.call_count}"
         )
 
     def test_capture_image_ptp_session_already_opened_all_retries_kill_gvfs(self, tmp_path):
         """Each PTP Session Already Opened attempt must kill gvfs before the next retry.
 
         When all _PTP_MAX_ATTEMPTS fail with this error, gvfs must have been
-        killed _PTP_MAX_ATTEMPTS times: once proactively before the first
-        attempt and once per retry gap (_PTP_MAX_ATTEMPTS - 1).
+        killed 1 (from _enable_liveview) + _PTP_MAX_ATTEMPTS (one per loop
+        iteration) times total.
         """
         import camera as cam
 
@@ -1025,10 +1021,11 @@ class TestCameraModule:
             with pytest.raises(RuntimeError, match="PTP Session Already Opened"):
                 cam.capture_image(tmp_path)
 
-        # 1 proactive + (_PTP_MAX_ATTEMPTS - 1) retry gaps = _PTP_MAX_ATTEMPTS total.
-        assert mock_kill.call_count == cam._PTP_MAX_ATTEMPTS, (
-            f"Expected gvfs to be killed {cam._PTP_MAX_ATTEMPTS} time(s) "
-            f"(1 proactive + {cam._PTP_MAX_ATTEMPTS - 1} retry gap(s)); "
+        # 1 from _enable_liveview + _PTP_MAX_ATTEMPTS from the loop.
+        expected = 1 + cam._PTP_MAX_ATTEMPTS
+        assert mock_kill.call_count == expected, (
+            f"Expected gvfs to be killed {expected} time(s) "
+            f"(1 liveview + {cam._PTP_MAX_ATTEMPTS} loop); "
             f"got {mock_kill.call_count}"
         )
 
