@@ -320,6 +320,68 @@ class TestCameraModule:
             "mount is detached before the daemon is killed"
         )
 
+    def test_kill_gvfs_monitor_falls_back_to_umount_when_fusermount_missing(self):
+        """When fusermount is not installed, _kill_gvfs_monitor must fall back to umount -l.
+
+        The ``fusermount`` binary is part of the ``fuse`` / ``fuse3`` package
+        which may not be installed on every system.  ``umount -l`` (part of
+        ``util-linux``) must be used as a fallback so that the gvfs FUSE mount
+        can still be released without requiring the fuse package.
+        """
+        import camera as cam
+
+        called_cmds: list[list[str]] = []
+
+        def side_effect(cmd, **kwargs):
+            called_cmds.append(list(cmd))
+            if cmd and cmd[0] == "fusermount":
+                raise FileNotFoundError("fusermount not found")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with (
+            patch("camera.subprocess.run", side_effect=side_effect),
+            patch("camera.time.sleep"),
+        ):
+            cam._kill_gvfs_monitor()
+
+        command_strings = [" ".join(cmd) for cmd in called_cmds]
+        assert any("umount" in c and "-l" in c for c in command_strings), (
+            "umount -l was not called as a fallback when fusermount is missing; "
+            "the gvfs FUSE mount must be releasable without the fuse package"
+        )
+
+    def test_kill_gvfs_monitor_umount_before_killing_when_fusermount_missing(self):
+        """When fusermount is absent, umount -l must still run before pkill gvfsd-fuse."""
+        import camera as cam
+
+        called_cmds: list[list[str]] = []
+
+        def side_effect(cmd, **kwargs):
+            called_cmds.append(list(cmd))
+            if cmd and cmd[0] == "fusermount":
+                raise FileNotFoundError("fusermount not found")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with (
+            patch("camera.subprocess.run", side_effect=side_effect),
+            patch("camera.time.sleep"),
+        ):
+            cam._kill_gvfs_monitor()
+
+        command_strings = [" ".join(cmd) for cmd in called_cmds]
+        umount_indices = [
+            i for i, c in enumerate(command_strings) if "umount" in c and "-l" in c
+        ]
+        gvfsd_fuse_kill_indices = [
+            i for i, c in enumerate(command_strings)
+            if "pkill" in c and "gvfsd-fuse" in c
+        ]
+        assert umount_indices, "umount -l was never called as a fallback"
+        assert gvfsd_fuse_kill_indices, "gvfsd-fuse was never killed via pkill"
+        assert max(umount_indices) < min(gvfsd_fuse_kill_indices), (
+            "umount -l fallback must run before pkill gvfsd-fuse"
+        )
+
     def test_capture_image_kills_gvfs_before_first_attempt(self, tmp_path):
         """capture_image must kill gvfs daemons before the first capture attempt.
 
@@ -570,6 +632,60 @@ class TestCameraModule:
         assert call_log.count("aperture") == 1, (
             f"aperture was queried {call_log.count('aperture')} time(s); expected 1. "
             f"Full call log: {call_log}"
+        )
+
+    def test_get_exposure_settings_no_warning_when_aperture_falls_back_to_f_number(
+        self, caplog
+    ):
+        """get_exposure_settings must NOT log a WARNING when aperture is absent
+        but f-number provides the value successfully.
+
+        The 'aperture' key is missing on Nikon bodies (which expose 'f-number'
+        instead).  Because get_exposure_settings has an explicit fallback, the
+        absence of 'aperture' is expected and must only produce a DEBUG message,
+        not a WARNING, to avoid flooding production logs on every status poll.
+        """
+        import camera as cam
+
+        aperture_exc = subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["/usr/bin/gphoto2", "--get-config", "aperture"],
+            stderr="aperture not found in configuration tree.",
+            output="",
+        )
+        f_number_result = subprocess.CompletedProcess(
+            args=[], returncode=0,
+            stdout="Label: F-Number\nType: RADIO\nCurrent: f/4\nChoice: 0 f/4\n",
+            stderr="",
+        )
+        generic_result = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="Current: 1/100\n", stderr=""
+        )
+
+        def mock_run(args, **kwargs):
+            if "--get-config" in args:
+                key = args[args.index("--get-config") + 1]
+                if key == "aperture":
+                    raise aperture_exc
+                if key == "f-number":
+                    return f_number_result
+            return generic_result
+
+        with (
+            patch.object(cam, "GPHOTO2_BIN", "/usr/bin/gphoto2"),
+            patch.object(cam, "_run", side_effect=mock_run),
+            caplog.at_level(logging.DEBUG, logger="camera"),
+        ):
+            settings = cam.get_exposure_settings()
+
+        assert settings["aperture"] == "f/4", "fallback to f-number must succeed"
+        warning_records = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and "aperture" in r.message
+        ]
+        assert not warning_records, (
+            "No WARNING should be logged when aperture falls back to f-number; "
+            f"got: {[r.message for r in warning_records]}"
         )
 
     def test_capture_image_uses_cwd_for_download(self, tmp_path):
