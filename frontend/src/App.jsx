@@ -32,7 +32,12 @@ export default function App() {
             gphoto2 Astro WebUI
           </h1>
         </div>
-        <StatusBadge connected={status?.connected ?? false} />
+        <StatusBadge
+          connected={status?.connected ?? false}
+          shootingMode={status?.shooting_mode}
+          focusMode={status?.focus_mode}
+          battery={status?.battery}
+        />
       </header>
 
       <div className="max-w-7xl mx-auto px-4 py-6 space-y-6">

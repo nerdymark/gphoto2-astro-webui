@@ -241,7 +241,7 @@ def is_camera_connected() -> bool:
 
 
 def get_camera_summary() -> dict:
-    """Return basic camera info."""
+    """Return basic camera info including shooting mode and battery level."""
     global _cached_summary
 
     # While a capture is in progress, return cached data to avoid opening a
@@ -254,7 +254,28 @@ def get_camera_summary() -> dict:
         return {"connected": False, "model": "No camera", "summary": ""}
     try:
         result = _run(["--summary"])
-        summary = {"connected": True, "model": "", "summary": result.stdout}
+
+        # Fetch shooting mode – try Nikon-style key first, then generic.
+        shooting_mode, _ = _get_config("autoexposuremode", warn_if_missing=False)
+        if shooting_mode is None:
+            shooting_mode, _ = _get_config("expprogram", warn_if_missing=False)
+
+        # Fetch focus mode (AF/MF) – Nikon uses focusmode2, others focusmode.
+        focus_mode, _ = _get_config("focusmode2", warn_if_missing=False)
+        if focus_mode is None:
+            focus_mode, _ = _get_config("focusmode", warn_if_missing=False)
+
+        # Fetch battery level if available.
+        battery, _ = _get_config("batterylevel", warn_if_missing=False)
+
+        summary = {
+            "connected": True,
+            "model": "",
+            "summary": result.stdout,
+            "shooting_mode": shooting_mode,
+            "focus_mode": focus_mode,
+            "battery": battery,
+        }
         _cached_summary = summary
         return summary
     except subprocess.CalledProcessError as exc:
