@@ -47,7 +47,7 @@ _camera_lock = threading.RLock()
 def _kill_gvfs_monitor() -> None:
     """Stop GNOME VFS processes that hold the camera's USB interface.
 
-    Three groups of cooperating GNOME VFS processes can claim a camera's USB
+    Four groups of cooperating GNOME VFS processes can claim a camera's USB
     interface, depending on how the camera presents itself to the OS:
 
     * gvfs-gphoto2-volume-monitor / gvfsd-gphoto2 – used when the camera is
@@ -57,6 +57,10 @@ def _kill_gvfs_monitor() -> None:
       USB mode, so the OS always sees them as MTP.  On Raspberry Pi OS Desktop
       gvfs-mtp-volume-monitor auto-starts at login and immediately claims the
       camera, making it the primary cause of "PTP Access Denied" errors.
+    * gvfsd – the master GNOME VFS daemon.  It supervises all worker daemons
+      and can restart them after they are killed.  Stopping gvfsd (or the
+      gvfs-daemon user service) prevents automatic restarts that would
+      re-claim the camera's USB interface before gphoto2 can acquire it.
 
     Killing only the volume monitor leaves the worker daemon running with the
     interface still claimed.  Both monitor and worker must be stopped for each
@@ -68,7 +72,7 @@ def _kill_gvfs_monitor() -> None:
     """
     logger.warning(
         "USB device is claimed by another process; "
-        "attempting to stop gvfs-gphoto2-volume-monitor, gvfsd-gphoto2, "
+        "attempting to stop gvfsd, gvfs-gphoto2-volume-monitor, gvfsd-gphoto2, "
         "gvfs-mtp-volume-monitor, and gvfsd-mtp…"
     )
     for cmd in (
@@ -78,6 +82,8 @@ def _kill_gvfs_monitor() -> None:
         ["systemctl", "--user", "stop", "gvfs-mtp-volume-monitor"],
         ["pkill", "-f", "gvfs-mtp-volume-monitor"],
         ["pkill", "-f", "gvfsd-mtp"],
+        ["systemctl", "--user", "stop", "gvfs-daemon"],
+        ["pkill", "-f", "gvfsd"],
     ):
         try:
             subprocess.run(cmd, capture_output=True, timeout=5)
