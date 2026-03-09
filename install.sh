@@ -190,22 +190,6 @@ sudo apt-get install -y -qq \
 info "Removing gvfs camera/MTP backends (gvfs-backends, gvfs-fuse)…"
 sudo apt-get remove -y -qq gvfs-backends gvfs-fuse 2>&1 || true
 
-# Extra backstop: rename gvfs dbus/mount service files so they cannot auto-start
-# even if gvfs-backends could not be removed (e.g. due to desktop dependencies).
-for _gvfs_file in \
-    /usr/share/dbus-1/services/org.gtk.Private.GPhoto2VolumeMonitor.service \
-    /usr/share/dbus-1/services/org.gtk.Private.MTPVolumeMonitor.service \
-    /usr/share/gvfs/mounts/gphoto2.mount \
-    /usr/share/gvfs/mounts/mtp.mount \
-    /usr/share/gvfs/remote-volume-monitors/gphoto2.monitor \
-    /usr/share/gvfs/remote-volume-monitors/mtp.monitor
-do
-    if [[ -f "$_gvfs_file" ]]; then
-        info "Disabling ${_gvfs_file}…"
-        sudo mv "$_gvfs_file" "${_gvfs_file}.disabled" 2>/dev/null || true
-    fi
-done
-
 # Refresh the dynamic-linker cache; the apt post-install scripts already do
 # this, but an explicit call ensures the new libraries are visible to every
 # subsequent command in this script.
@@ -478,8 +462,8 @@ server {
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_read_timeout 600;
-        proxy_send_timeout 600;
+        proxy_read_timeout 120;
+        proxy_send_timeout 120;
     }
 }
 EOF
