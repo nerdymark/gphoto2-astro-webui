@@ -1,6 +1,32 @@
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import * as api from "../api/client";
 import { imageUrl } from "../api/client";
+
+function useElapsed(active) {
+  const [elapsed, setElapsed] = useState(0);
+  const startRef = useRef(null);
+  useEffect(() => {
+    if (!active) {
+      startRef.current = null;
+      return;
+    }
+    startRef.current = Date.now();
+    const id = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - startRef.current) / 1000));
+    }, 1000);
+    return () => {
+      clearInterval(id);
+      setElapsed(0);
+    };
+  }, [active]);
+  return elapsed;
+}
+
+function formatElapsed(s) {
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
 
 export default function StackingPanel({ gallery, images, onStackComplete }) {
   const [selected, setSelected] = useState(new Set());
@@ -9,6 +35,7 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
   const [stacking, setStacking] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const elapsed = useElapsed(stacking);
 
   // Filter out already-stacked images from selection candidates
   const stackableImages = images.filter((img) => !img.filename.startsWith("stacked-"));
@@ -157,7 +184,7 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
             className="w-full rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-50 px-4 py-2.5 text-sm font-semibold text-white transition-colors"
           >
             {stacking
-              ? "Stacking…"
+              ? `Stacking… ${formatElapsed(elapsed)}`
               : `Stack ${selected.size} Image${selected.size !== 1 ? "s" : ""}`}
           </button>
 

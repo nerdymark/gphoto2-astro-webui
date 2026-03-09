@@ -75,6 +75,7 @@ export const stackImages = (gallery, images, mode, outputName) =>
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ images, mode, output_name: outputName }),
+    timeout: 600000, // 10 minutes – large stacks are slow on RPi
   });
 
 export const imageUrl = (gallery, filename) =>
