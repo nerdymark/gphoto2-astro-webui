@@ -63,6 +63,15 @@ _DEFAULT_BULB_SECONDS = 10
 # calls _run again for --summary).
 _camera_lock = threading.RLock()
 
+# Flag set while a capture sequence is in progress.  Read-only callers
+# (status polls, exposure reads) check this and return cached data instead
+# of opening competing PTP sessions that would cause "PTP Access Denied".
+_capture_active = threading.Event()
+
+# Cached results for status and exposure, returned when capture is active.
+_cached_summary: Optional[dict] = None
+_cached_exposure: Optional[dict] = None
+
 
 def _kill_gvfs_monitor() -> None:
     """Stop GNOME VFS processes that hold the camera's USB interface.
@@ -212,6 +221,10 @@ def is_camera_connected() -> bool:
     if not GPHOTO2_BIN:
         logger.warning("gphoto2 binary not found – running in simulation mode")
         return False
+    # During capture, assume the camera is still connected to avoid opening
+    # a competing PTP session from a status poll.
+    if _capture_active.is_set():
+        return True
     try:
         result = _run(["--auto-detect"], check=False)
         lines = result.stdout.strip().splitlines()
@@ -224,11 +237,21 @@ def is_camera_connected() -> bool:
 
 def get_camera_summary() -> dict:
     """Return basic camera info."""
+    global _cached_summary
+
+    # While a capture is in progress, return cached data to avoid opening a
+    # competing PTP session that would cause "PTP Access Denied".
+    if _capture_active.is_set() and _cached_summary is not None:
+        logger.debug("get_camera_summary: capture active, returning cached summary")
+        return _cached_summary
+
     if not GPHOTO2_BIN or not is_camera_connected():
         return {"connected": False, "model": "No camera", "summary": ""}
     try:
         result = _run(["--summary"])
-        return {"connected": True, "model": "", "summary": result.stdout}
+        summary = {"connected": True, "model": "", "summary": result.stdout}
+        _cached_summary = summary
+        return summary
     except subprocess.CalledProcessError as exc:
         stderr = (exc.stderr or "").strip()
         stdout = (exc.stdout or "").strip()
@@ -385,6 +408,14 @@ def get_exposure_settings() -> dict:
     separate calls for value and choices when the first key fails, reducing the
     number of subprocess invocations and the time the camera lock is held.
     """
+    global _cached_exposure
+
+    # While a capture is in progress, return cached data to avoid opening a
+    # competing PTP session that would cause "PTP Access Denied".
+    if _capture_active.is_set() and _cached_exposure is not None:
+        logger.debug("get_exposure_settings: capture active, returning cached exposure")
+        return _cached_exposure
+
     aperture, aperture_choices = _get_config("aperture", warn_if_missing=False)
     if aperture is None and not aperture_choices:
         aperture, aperture_choices = _get_config("f-number")
@@ -395,7 +426,7 @@ def get_exposure_settings() -> dict:
 
     iso, iso_choices = _get_config("iso")
 
-    return {
+    exposure = {
         "aperture": aperture,
         "shutter": shutter,
         "iso": iso,
@@ -403,6 +434,8 @@ def get_exposure_settings() -> dict:
         "shutter_choices": shutter_choices,
         "iso_choices": iso_choices,
     }
+    _cached_exposure = exposure
+    return exposure
 
 
 def _detect_aperture_key() -> str:
@@ -501,6 +534,19 @@ def capture_image(gallery_path: Path, bulb_seconds: Optional[int] = None) -> Pat
             "capture_image: camera is in Bulb/Time mode – using bulb capture sequence"
         )
 
+    # Signal other threads (status polls, exposure reads) to return cached
+    # data instead of opening competing PTP sessions during the capture.
+    _capture_active.set()
+    try:
+        return _do_capture(gallery_path, bulb, bulb_seconds)
+    finally:
+        _capture_active.clear()
+
+
+def _do_capture(
+    gallery_path: Path, bulb: bool, bulb_seconds: Optional[int]
+) -> Path:
+    """Inner capture logic, runs while _capture_active is set."""
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
             logger.debug("capture_image: starting capture into tmpdir=%s", tmpdir)
