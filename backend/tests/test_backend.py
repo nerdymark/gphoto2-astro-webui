@@ -172,6 +172,35 @@ class TestCameraModule:
             "gvfsd-gphoto2 was not targeted; it holds the USB interface and must be stopped"
         )
 
+    def test_kill_gvfs_monitor_kills_gvfsd(self):
+        """_kill_gvfs_monitor must also target gvfsd, the master GNOME VFS daemon.
+
+        Even after the camera-specific daemons (gvfsd-gphoto2, gvfsd-mtp) are
+        killed, gvfsd can restart them automatically when the camera is still
+        connected.  Stopping gvfsd (or the gvfs-daemon user service) prevents
+        those restarts and ensures the USB interface is fully released before
+        gphoto2 retries the capture.
+        """
+        import camera as cam
+
+        with (
+            patch("camera.subprocess.run") as mock_run,
+            patch("camera.time.sleep"),
+        ):
+            cam._kill_gvfs_monitor()
+
+        called_cmds = [call.args[0] for call in mock_run.call_args_list]
+        # Verify that gvfsd is targeted both via systemctl and pkill
+        assert ["systemctl", "--user", "stop", "gvfs-daemon"] in called_cmds, (
+            "systemctl --user stop gvfs-daemon was not called; "
+            "the gvfs-daemon user service must be stopped to prevent gvfsd from restarting workers"
+        )
+        assert ["pkill", "-f", "gvfsd"] in called_cmds, (
+            "pkill -f gvfsd was not called; "
+            "gvfsd (the master GNOME VFS daemon) must be killed to prevent it from "
+            "restarting the camera worker daemons and re-claiming the USB interface"
+        )
+
     def test_kill_gvfs_monitor_kills_gvfs_mtp_volume_monitor(self):
         """_kill_gvfs_monitor must also target the MTP volume monitor and its worker.
 
@@ -198,7 +227,7 @@ class TestCameraModule:
         )
 
     def test_kill_gvfs_monitor_warning_mentions_gvfsd(self, caplog):
-        """The warning log should mention both the gphoto2 and MTP daemons."""
+        """The warning log should mention the gphoto2, MTP, and master gvfsd daemons."""
         import camera as cam
 
         with (
@@ -211,6 +240,7 @@ class TestCameraModule:
         log_messages = " ".join(r.message for r in caplog.records)
         assert "gvfsd-gphoto2" in log_messages
         assert "gvfs-mtp-volume-monitor" in log_messages
+        assert "gvfsd" in log_messages
 
     def test_run_gives_up_after_max_usb_retries(self):
         """After _USB_MAX_ATTEMPTS failed attempts, _run stops retrying and raises."""
