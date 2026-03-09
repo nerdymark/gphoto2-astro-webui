@@ -7,9 +7,11 @@
 #   ./install.sh [--dev]
 #
 # What it does:
-#   1. Removes any distro-packaged gphoto2/libgphoto2 (apt) if present
-#   2. Builds libgphoto2 and gphoto2 from the latest upstream source
-#      (ensures full ltdl/dynamic plugin support and newest camera drivers)
+#   1. Installs gphoto2, libgphoto2-6, and libgphoto2-port12 from the distro
+#      package repository.  Using the packaged version avoids source-build
+#      link mismatches against libgphoto2-port that cause "PTP Access Denied"
+#      and "PTP Session Already Opened" errors with some cameras.
+#   2. Removes gvfs camera/MTP backends to prevent PTP session conflicts
 #   3. Creates a Python virtual environment in ./backend/.venv
 #   4. Installs Python dependencies
 #   5. Installs Node.js dependencies and builds the frontend
