@@ -1,17 +1,23 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import * as api from "../api/client";
 
 export function useCameraStatus() {
   const [status, setStatus] = useState(null);
   const [loading, setLoading] = useState(true);
+  const pendingRef = useRef(false);
 
   const refresh = useCallback(async () => {
+    // Skip if a previous poll is still in-flight to avoid piling up
+    // requests behind a slow camera lock.
+    if (pendingRef.current) return;
+    pendingRef.current = true;
     try {
       const data = await api.getCameraStatus();
       setStatus(data);
     } catch {
       setStatus({ connected: false });
     } finally {
+      pendingRef.current = false;
       setLoading(false);
     }
   }, []);

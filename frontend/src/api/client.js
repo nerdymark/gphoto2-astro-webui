@@ -5,16 +5,31 @@
 const BASE = import.meta.env.VITE_API_BASE ?? "";
 
 async function request(path, options = {}) {
-  const res = await fetch(`${BASE}${path}`, options);
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(text || res.statusText);
+  const { timeout = 30000, ...fetchOpts } = options;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const res = await fetch(`${BASE}${path}`, {
+      ...fetchOpts,
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => res.statusText);
+      throw new Error(text || res.statusText);
+    }
+    return res.json();
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error("Request timed out");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
   }
-  return res.json();
 }
 
 // Camera
-export const getCameraStatus = () => request("/api/camera/status");
+export const getCameraStatus = () => request("/api/camera/status", { timeout: 8000 });
 export const getExposure = () => request("/api/camera/exposure");
 export const setExposure = (body) =>
   request("/api/camera/exposure", {

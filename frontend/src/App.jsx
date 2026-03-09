@@ -57,6 +57,20 @@ export default function App() {
 
           {/* Right column: tabbed panel */}
           <div className="lg:col-span-2 space-y-4">
+            {/* Breadcrumb / gallery nav */}
+            {selectedGallery && (
+              <div className="flex items-center gap-2 text-sm">
+                <button
+                  onClick={() => setSelectedGallery(null)}
+                  className="text-slate-400 hover:text-slate-200 transition-colors"
+                >
+                  Galleries
+                </button>
+                <span className="text-slate-600">/</span>
+                <span className="text-indigo-400 font-medium">{selectedGallery}</span>
+              </div>
+            )}
+
             {/* Tab bar */}
             <div className="flex gap-1 bg-slate-800 rounded-lg p-1 border border-slate-700">
               {TABS.map((t) => (
