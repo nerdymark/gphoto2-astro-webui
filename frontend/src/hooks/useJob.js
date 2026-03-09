@@ -14,13 +14,14 @@ import * as api from "../api/client";
  */
 export function useJob({ onComplete, onFail } = {}) {
   const [job, setJob] = useState(null);
+  const [pollTrigger, setPollTrigger] = useState(0);
   const jobIdRef = useRef(null);
   const callbacksRef = useRef({ onComplete, onFail });
   useEffect(() => {
     callbacksRef.current = { onComplete, onFail };
   });
 
-  // Poll loop – runs while jobIdRef.current is set.
+  // Poll loop – starts when pollTrigger changes (i.e. startJob is called).
   useEffect(() => {
     if (!jobIdRef.current) return;
 
@@ -45,7 +46,6 @@ export function useJob({ onComplete, onFail } = {}) {
         } catch {
           // Network hiccup – keep polling.
         }
-        // Wait 1s between polls.
         await new Promise((r) => setTimeout(r, 1000));
       }
     };
@@ -53,11 +53,12 @@ export function useJob({ onComplete, onFail } = {}) {
     return () => {
       active = false;
     };
-  }, [job?.id]); // re-run when job ID changes
+  }, [pollTrigger]);
 
   const startJob = useCallback((jobId) => {
     jobIdRef.current = jobId;
     setJob({ id: jobId, status: "queued", progress: 0, total: 0, message: "" });
+    setPollTrigger((n) => n + 1);
   }, []);
 
   const cancelJob = useCallback(async () => {
