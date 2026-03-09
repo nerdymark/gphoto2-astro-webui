@@ -547,6 +547,7 @@ def _normal_capture(tmpdir: str) -> None:
                 "%Y%m%d-%H%M%S-%05n.%C",
                 "--force-overwrite",
             ],
+            check=False,
             cwd=tmpdir,
         )
         stderr_stripped = (result.stderr or "").strip()
@@ -572,6 +573,11 @@ def _normal_capture(tmpdir: str) -> None:
             raise RuntimeError(f"Capture failed: {stderr_stripped}")
         if stderr_stripped and "ERROR: Could not capture" in stderr_stripped:
             raise RuntimeError(f"Capture failed: {stderr_stripped}")
+        # Raise on any other non-zero exit code not handled above.
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Capture failed (exit {result.returncode}): {stderr_stripped}"
+            )
         break
 
 
