@@ -7,19 +7,27 @@
 #   ./install.sh [--dev]
 #
 # What it does:
-#   1. Installs gphoto2, libgphoto2-6, and libgphoto2-port12 from the distro
-#      package repository.  Using the packaged version avoids source-build
-#      link mismatches against libgphoto2-port that cause "PTP Access Denied"
-#      and "PTP Session Already Opened" errors with some cameras.
-#   2. Removes gvfs camera/MTP backends to prevent PTP session conflicts
-#   3. Creates a Python virtual environment in ./backend/.venv
-#   4. Installs Python dependencies
-#   5. Installs Node.js dependencies and builds the frontend
-#   6. Writes a systemd service file so the backend starts on boot
-#   7. Optionally configures nginx as a reverse proxy
+#   1. Installs gphoto2, libgphoto2-6(t64), and libgphoto2-port12(t64) from
+#      the distro package repository.  The correct package name variant is
+#      detected automatically: Bookworm uses the 't64' suffix for the 64-bit
+#      time_t ABI transition; Bullseye uses the plain names.  Using the
+#      packaged version avoids source-build link mismatches against
+#      libgphoto2-port that cause "PTP Access Denied" / "PTP Session Already
+#      Opened" errors with some cameras.
+#   2. Detects any locally-built gphoto2 under /usr/local (installed by a
+#      previous version of this script) and offers to remove it so there is
+#      only one gphoto2 binary on the system.
+#   3. Removes gvfs camera/MTP backends to prevent PTP session conflicts
+#   4. Creates a Python virtual environment in ./backend/.venv
+#   5. Installs Python dependencies
+#   6. Installs Node.js dependencies and builds the frontend
+#   7. Writes a systemd service file so the backend starts on boot
+#   8. Optionally configures nginx as a reverse proxy
 #
 # Options:
 #   --dev  Development mode: skips nginx and does not start the service.
+#   --yes  Non-interactive: automatically remove a locally-built gphoto2
+#          without prompting (useful when running the script unattended).
 # =============================================================================
 
 set -euo pipefail
@@ -35,105 +43,88 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEV_MODE=false
+YES_MODE=false
 
 for arg in "$@"; do
   case "$arg" in
     --dev) DEV_MODE=true ;;
+    --yes|-y) YES_MODE=true ;;
   esac
 done
 
 # ---------------------------------------------------------------------------
-# Build gphoto2 + libgphoto2 from upstream source
+# Detect and offer to remove a locally-built (source-installed) gphoto2.
 #
-# Distro packages are often many releases behind and are compiled without
-# ltdl (dynamic plugin loading), which limits camera driver support.
-# Building from source guarantees the latest upstream version with full
-# driver support.  Installed to /usr/local.
+# A previous version of this installer compiled gphoto2 and libgphoto2 from
+# source and installed them under /usr/local.  Leaving those files in place
+# while also installing the distro package creates two competing gphoto2
+# binaries and two sets of libgphoto2 shared libraries on the linker search
+# path, which produces unpredictable USB port library mismatches and is a
+# root cause of persistent "PTP Access Denied" / "PTP Session Already Opened"
+# errors.
+#
+# This function detects the source-installed files and, with the user's
+# permission (or automatically with --yes / in non-interactive mode), removes
+# them so the distro package is the sole gphoto2 on the system.
 # ---------------------------------------------------------------------------
-build_gphoto2_from_source() {
-    info "Building libgphoto2 and gphoto2 from upstream source…"
-    info "This may take 20–40 minutes on a Raspberry Pi – please be patient."
+remove_source_build() {
+    # The source build installs the gphoto2 binary to /usr/local/bin.
+    # The distro package installs it to /usr/bin.  The presence of
+    # /usr/local/bin/gphoto2 is therefore a reliable indicator that a
+    # source build was previously installed by this script.
+    if [[ ! -f /usr/local/bin/gphoto2 ]]; then
+        return 0
+    fi
 
-    # Build-time dependencies
-    info "Installing gphoto2 build dependencies…"
-    sudo apt-get install -y -qq \
-        build-essential \
-        autoconf \
-        automake \
-        libtool \
-        pkg-config \
-        libusb-1.0-0-dev \
-        libexif-dev \
-        libpopt-dev \
-        libltdl-dev \
-        gettext
+    local src_ver
+    src_ver=$(/usr/local/bin/gphoto2 --version 2>&1 | head -1 || true)
+    warn "Locally-built gphoto2 detected: ${src_ver:-unknown version}"
+    warn "The following files will be removed:"
+    warn "  /usr/local/bin/gphoto2"
+    warn "  /usr/local/lib/libgphoto2*.so*     (shared libraries)"
+    warn "  /usr/local/lib/libgphoto2/          (camera driver plugins)"
+    warn "  /usr/local/lib/libgphoto2_port/     (port driver plugins)"
+    warn "  /usr/local/share/libgphoto2/        (camera definitions)"
+    warn "  /usr/local/lib/pkgconfig/libgphoto2*.pc"
+    echo
 
-    local WORK
-    WORK=$(mktemp -d /tmp/gphoto2-src-XXXXXX)
+    local do_remove=false
+    if $YES_MODE; then
+        do_remove=true
+    elif [[ -t 0 ]]; then
+        # Interactive terminal – prompt the user.
+        read -r -p "$(echo -e "${YELLOW}[WARN]${NC}  Remove locally-built gphoto2 and use the distro package instead? [Y/n] ")" _reply
+        case "${_reply:-Y}" in
+            [Yy]*|"") do_remove=true ;;
+            *)
+                warn "Skipping removal of locally-built gphoto2."
+                warn "Both versions will be present; the distro package may not take effect."
+                return 0
+                ;;
+        esac
+    else
+        # Non-interactive (piped or redirected stdin) – default to removing so
+        # the script is safe to run unattended (e.g. from another script or CI).
+        info "Non-interactive mode: removing locally-built gphoto2 automatically."
+        do_remove=true
+    fi
 
-    # _build_one GITHUB_REPO LOCAL_NAME
-    #   Downloads the latest release tarball, builds, and installs to /usr/local.
-    _build_one() {
-        local repo="$1" name="$2"
-
-        info "Fetching latest ${name} release info from GitHub…"
-        local api_response tag
-        api_response=$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest") \
-            || error "Failed to reach GitHub API for ${repo} – check network connectivity."
-        tag=$(printf '%s' "$api_response" \
-              | grep -m1 '"tag_name"' \
-              | sed 's/.*"tag_name" *: *"\([^"]*\)".*/\1/')
-        [[ -z "$tag" ]] && error "Could not determine latest ${name} release tag (API response may be malformed or rate-limited)."
-
-        local ver="${tag#v}"   # strip any leading 'v'
-        local tarball="${name}-${ver}.tar.bz2"
-        local url="https://github.com/${repo}/releases/download/${tag}/${tarball}"
-
-        info "Downloading ${name} ${ver}…"
-        curl -fsSL "$url" -o "${WORK}/${tarball}" \
-            || error "Failed to download ${name} ${ver} from ${url}."
-
-        info "Extracting ${tarball}…"
-        tar -xjf "${WORK}/${tarball}" -C "$WORK" \
-            || error "Failed to extract ${tarball}."
-
-        local src_dir="${WORK}/${name}-${ver}"
-        [[ -d "$src_dir" ]] || error "Expected source directory ${src_dir} not found after extraction."
-
-        info "Configuring ${name} ${ver}…"
-        pushd "$src_dir" > /dev/null
-        # autoreconf regenerates the build system; harmless if already up-to-date.
-        # Export PKG_CONFIG_PATH before configure AND make so every build step
-        # can locate the freshly-installed libgphoto2 pkg-config files.
-        export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-        if ! autoreconf --install 2>/dev/null; then
-            warn "autoreconf returned non-zero for ${name} – attempting ./configure anyway."
-        fi
-        ./configure --prefix=/usr/local --disable-rpath \
-            || error "${name} ./configure failed."
-
-        info "Compiling ${name} ${ver} ($(nproc) thread(s))…"
-        make -j"$(nproc)" || error "${name} make failed."
-
-        info "Installing ${name} ${ver}…"
-        sudo make install || error "${name} make install failed."
-        popd > /dev/null
-
-        info "${name} ${ver} installed to /usr/local."
-    }
-
-    _build_one "gphoto/libgphoto2" "libgphoto2"
-    # Refresh the dynamic-linker cache so the new libgphoto2 is found at
-    # link time when building the gphoto2 CLI below.
-    sudo ldconfig
-
-    _build_one "gphoto/gphoto2" "gphoto2"
-
-    rm -rf "$WORK"
-
-    local built_ver
-    built_ver=$(gphoto2 --version 2>&1 | head -1 || true)
-    info "gphoto2 from source ready: ${built_ver}"
+    if $do_remove; then
+        info "Removing locally-built gphoto2 and libgphoto2 from /usr/local…"
+        sudo rm -f  /usr/local/bin/gphoto2
+        sudo rm -f  /usr/local/lib/libgphoto2.so*
+        sudo rm -f  /usr/local/lib/libgphoto2_port.so*
+        sudo rm -rf /usr/local/lib/libgphoto2
+        sudo rm -rf /usr/local/lib/libgphoto2_port
+        sudo rm -rf /usr/local/share/libgphoto2
+        sudo rm -f  /usr/local/lib/pkgconfig/libgphoto2.pc
+        sudo rm -f  /usr/local/lib/pkgconfig/libgphoto2_port.pc
+        # Remove the update-alternatives entry registered by the old installer;
+        # ignore the error if it was never registered or has already been removed.
+        sudo update-alternatives --remove gphoto2 /usr/local/bin/gphoto2 2>/dev/null || true
+        sudo ldconfig
+        info "Locally-built gphoto2 removed."
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -142,7 +133,34 @@ build_gphoto2_from_source() {
 info "Updating package list…"
 sudo apt-get update -qq
 
-info "Installing system dependencies…"
+# Remove any locally-built (source-installed) gphoto2 before installing the
+# distro package to avoid having two competing versions on the system.
+remove_source_build
+
+# ---------------------------------------------------------------------------
+# Determine the correct libgphoto2 port-library package name for this distro.
+#
+# Debian Bookworm (and Raspberry Pi OS Bookworm) added a 't64' suffix to
+# packages that underwent the 64-bit time_t ABI transition; the package is
+# therefore named 'libgphoto2-port12t64' on Bookworm and 'libgphoto2-port12'
+# on Bullseye.  Likewise the main library is 'libgphoto2-6t64' on Bookworm.
+# apt-cache show probes the local package database without downloading
+# anything – it is fast and works offline.
+# ---------------------------------------------------------------------------
+if apt-cache show libgphoto2-port12t64 &>/dev/null; then
+    _GPHOTO2_PORT_PKG="libgphoto2-port12t64"
+else
+    _GPHOTO2_PORT_PKG="libgphoto2-port12"
+fi
+info "libgphoto2 port library package: ${_GPHOTO2_PORT_PKG}"
+
+if apt-cache show libgphoto2-6t64 &>/dev/null; then
+    _LIBGPHOTO2_PKG="libgphoto2-6t64"
+else
+    _LIBGPHOTO2_PKG="libgphoto2-6"
+fi
+
+info "Installing system dependencies and gphoto2 from distro packages…"
 sudo apt-get install -y -qq \
     python3 \
     python3-pip \
@@ -152,14 +170,10 @@ sudo apt-get install -y -qq \
     zlib1g-dev \
     libopenblas0 \
     git \
-    curl
-
-# ---------------------------------------------------------------------------
-# Remove any distro-packaged gphoto2/libgphoto2 to avoid conflicts with the
-# locally built version.
-# ---------------------------------------------------------------------------
-info "Removing any distro-packaged gphoto2/libgphoto2 (if installed)…"
-sudo apt-get remove -y -qq gphoto2 libgphoto2-dev libgphoto2-6 2>&1 || true
+    curl \
+    gphoto2 \
+    "${_LIBGPHOTO2_PKG}" \
+    "${_GPHOTO2_PORT_PKG}"
 
 # ---------------------------------------------------------------------------
 # Remove gvfs camera/MTP backends
@@ -176,22 +190,13 @@ sudo apt-get remove -y -qq gphoto2 libgphoto2-dev libgphoto2-6 2>&1 || true
 info "Removing gvfs camera/MTP backends (gvfs-backends, gvfs-fuse)…"
 sudo apt-get remove -y -qq gvfs-backends gvfs-fuse 2>&1 || true
 
-build_gphoto2_from_source
-
-# Register the locally built binary with update-alternatives so that
-# /usr/bin/gphoto2 always points to the local build regardless of PATH order.
-# This prevents the systemd service (or any other process) from accidentally
-# picking up a distro-packaged binary that may be installed later.
-info "Registering locally built gphoto2 with update-alternatives…"
-# Priority 100 is intentionally higher than the Debian/Raspbian package default
-# (50), so the locally built binary remains the active alternative even if the
-# distro package is ever reinstalled.
-sudo update-alternatives --install /usr/bin/gphoto2 gphoto2 /usr/local/bin/gphoto2 100
-sudo update-alternatives --set gphoto2 /usr/local/bin/gphoto2
-
-# Refresh the dynamic-linker cache so the locally built libgphoto2 is found
-# by anything that links against it (including the gphoto2 CLI registered above).
+# Refresh the dynamic-linker cache; the apt post-install scripts already do
+# this, but an explicit call ensures the new libraries are visible to every
+# subsequent command in this script.
 sudo ldconfig
+
+_installed_ver=$(gphoto2 --version 2>&1 | head -1 || true)
+info "gphoto2 package ready: ${_installed_ver}"
 
 # ---------------------------------------------------------------------------
 # udev rule: prevent gvfs from auto-mounting cameras controlled by gphoto2
