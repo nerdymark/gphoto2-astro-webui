@@ -1,6 +1,16 @@
 import { useState, useEffect, useCallback } from "react";
 import * as api from "../api/client";
-import { imageUrl } from "../api/client";
+import { imageUrl, videoUrl } from "../api/client";
+
+const VIDEO_EXTENSIONS = [".mp4", ".webm"];
+
+function isVideo(filename) {
+  return VIDEO_EXTENSIONS.some((ext) => filename.toLowerCase().endsWith(ext));
+}
+
+function mediaUrl(gallery, filename) {
+  return isVideo(filename) ? videoUrl(gallery, filename) : imageUrl(gallery, filename);
+}
 
 export default function GalleryViewer({ gallery, images, onRefresh }) {
   const [lightboxIndex, setLightboxIndex] = useState(null);
@@ -76,14 +86,31 @@ export default function GalleryViewer({ gallery, images, onRefresh }) {
             <div key={img.filename} className="group relative">
               <button
                 onClick={() => setLightboxIndex(idx)}
-                className="block w-full aspect-square overflow-hidden rounded-lg border border-slate-700 hover:border-indigo-500 transition-colors"
+                className="block w-full aspect-square overflow-hidden rounded-lg border border-slate-700 hover:border-indigo-500 transition-colors relative"
               >
-                <img
-                  src={imageUrl(gallery, img.filename)}
-                  alt={img.filename}
-                  className="w-full h-full object-cover"
-                  loading="lazy"
-                />
+                {isVideo(img.filename) ? (
+                  <>
+                    <div className="w-full h-full bg-slate-900 flex items-center justify-center">
+                      <svg className="w-12 h-12 text-indigo-400" fill="currentColor" viewBox="0 0 20 20">
+                        <path
+                          fillRule="evenodd"
+                          d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8v4a1 1 0 001.555.832l3-2a1 1 0 000-1.664l-3-2z"
+                          clipRule="evenodd"
+                        />
+                      </svg>
+                    </div>
+                    <span className="absolute bottom-1 left-1 bg-black/70 text-indigo-300 text-[10px] font-semibold px-1.5 py-0.5 rounded">
+                      VIDEO
+                    </span>
+                  </>
+                ) : (
+                  <img
+                    src={imageUrl(gallery, img.filename)}
+                    alt={img.filename}
+                    className="w-full h-full object-cover"
+                    loading="lazy"
+                  />
+                )}
               </button>
               <p className="text-xs text-slate-500 truncate mt-0.5 px-0.5">
                 {img.filename}
@@ -128,18 +155,27 @@ export default function GalleryViewer({ gallery, images, onRefresh }) {
             >
               ✕
             </button>
-            <img
-              src={imageUrl(gallery, lightbox.filename)}
-              alt={lightbox.filename}
-              className="w-full rounded-lg max-h-[80vh] object-contain"
-            />
+            {isVideo(lightbox.filename) ? (
+              <video
+                src={videoUrl(gallery, lightbox.filename)}
+                controls
+                autoPlay
+                className="w-full rounded-lg max-h-[80vh]"
+              />
+            ) : (
+              <img
+                src={imageUrl(gallery, lightbox.filename)}
+                alt={lightbox.filename}
+                className="w-full rounded-lg max-h-[80vh] object-contain"
+              />
+            )}
             <div className="flex items-center justify-between mt-2 px-1">
               <p className="text-slate-400 text-xs">
                 {lightboxIndex + 1} / {images.length}
               </p>
               <p className="text-slate-400 text-xs">{lightbox.filename}</p>
               <a
-                href={imageUrl(gallery, lightbox.filename)}
+                href={mediaUrl(gallery, lightbox.filename)}
                 download={lightbox.filename}
                 className="text-indigo-400 text-sm hover:underline"
                 onClick={(e) => e.stopPropagation()}
