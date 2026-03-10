@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
 import * as api from "../api/client";
-import { imageUrl, videoUrl } from "../api/client";
+import { imageUrl, videoUrl, thumbnailUrl } from "../api/client";
 
 const VIDEO_EXTENSIONS = [".mp4", ".webm"];
 
@@ -105,7 +105,7 @@ export default function GalleryViewer({ gallery, images, onRefresh }) {
                   </>
                 ) : (
                   <img
-                    src={imageUrl(gallery, img.filename)}
+                    src={thumbnailUrl(gallery, img.filename)}
                     alt={img.filename}
                     className="w-full h-full object-cover"
                     loading="lazy"

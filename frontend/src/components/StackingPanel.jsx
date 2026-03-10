@@ -1,6 +1,6 @@
 import { useState } from "react";
 import * as api from "../api/client";
-import { imageUrl } from "../api/client";
+import { thumbnailUrl } from "../api/client";
 
 export default function StackingPanel({ gallery, images, onStackComplete }) {
   const [selected, setSelected] = useState(new Set());
@@ -103,7 +103,7 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
                   }`}
                 >
                   <img
-                    src={imageUrl(gallery, img.filename)}
+                    src={thumbnailUrl(gallery, img.filename)}
                     alt={img.filename}
                     className="w-full h-full object-cover"
                   />
