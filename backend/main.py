@@ -92,8 +92,8 @@ class StackRequest(BaseModel):
 
 class TimelapseRequest(BaseModel):
     images: list[str]
-    fps: int = 60
-    resolution: str = "3840x2160"
+    fps: int = 30
+    resolution: str = "1920x1080"
     output_name: Optional[str] = None
 
 

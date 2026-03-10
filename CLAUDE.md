@@ -83,7 +83,7 @@ Tests use `unittest.mock` to mock gphoto2 subprocess calls. Test file: `backend/
 - **Config key fallbacks**: Nikon cameras use `f-number` instead of `aperture` and may use `shutterspeed2` instead of `shutterspeed`. The getter and setter both probe for the correct key.
 - **Path sanitization**: Gallery names are validated to allow only `[a-zA-Z0-9._\- ]`
 - **Pydantic models**: Used for request/response validation (`ExposureSettings`, `CaptureRequest`, `StackRequest`, `TimelapseRequest`, `CreateGalleryRequest`)
-- **Timelapse generation**: Uses ffmpeg subprocess to encode images into 4K 60fps MP4 videos. Concat demuxer approach handles arbitrary filenames. Runs as a background job.
+- **Timelapse generation**: Pre-resizes images to target resolution via Pillow, then encodes with ffmpeg (ultrafast preset). Default 1920x1080 @ 30fps for Pi 2 compatibility. 4K available as an option. Concat demuxer handles arbitrary filenames. Runs as a background job.
 - **Image formats**: Supports .jpg, .jpeg, .png, .tif, .cr2, .nef, .arw
 
 ### Frontend (React/JSX)
