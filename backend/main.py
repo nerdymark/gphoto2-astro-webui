@@ -27,6 +27,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from PIL import Image
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -218,7 +220,7 @@ def list_galleries():
                 {
                     "name": d.name,
                     "image_count": len(images),
-                    "thumbnail": f"/api/images/{d.name}/{images[0]}" if images else None,
+                    "thumbnail": f"/api/thumbnails/{d.name}/{images[0]}" if images else None,
                 }
             )
     return {"galleries": galleries}
@@ -449,6 +451,17 @@ async def cancel_job(job_id: str):
 # ---------------------------------------------------------------------------
 
 
+@app.get("/api/thumbnails/{gallery}/{filename}")
+def serve_thumbnail(gallery: str, filename: str):
+    """Serve a cached 300px thumbnail for a gallery image."""
+    gallery_dir = _gallery_path(gallery)
+    file_path = gallery_dir / filename
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    thumb_path = _get_or_create_thumbnail(gallery_dir, file_path)
+    return FileResponse(str(thumb_path), media_type="image/jpeg")
+
+
 @app.get("/api/images/{gallery}/{filename}")
 def serve_image(gallery: str, filename: str):
     gallery_dir = _gallery_path(gallery)
@@ -503,6 +516,37 @@ def _resolve_gallery(name: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".cr2", ".cr3", ".nef", ".arw"}
+_VIDEO_EXTS = {".mp4", ".webm"}
+_MEDIA_EXTS = _IMAGE_EXTS | _VIDEO_EXTS
+
+
 def _list_images(directory: Path) -> list[str]:
-    exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".cr2", ".cr3", ".nef", ".arw"}
-    return sorted(f.name for f in directory.iterdir() if f.suffix.lower() in exts)
+    return sorted(f.name for f in directory.iterdir() if f.suffix.lower() in _MEDIA_EXTS)
+
+
+_THUMB_SIZE = 300
+_THUMB_DIR = ".thumbs"
+
+
+def _get_or_create_thumbnail(gallery_dir: Path, file_path: Path) -> Path:
+    """Return the path to a cached JPEG thumbnail, creating it if needed."""
+    thumb_dir = gallery_dir / _THUMB_DIR
+    thumb_dir.mkdir(exist_ok=True)
+    thumb_name = file_path.stem + ".thumb.jpg"
+    thumb_path = thumb_dir / thumb_name
+
+    # Regenerate if source is newer than cached thumbnail
+    if thumb_path.exists() and thumb_path.stat().st_mtime >= file_path.stat().st_mtime:
+        return thumb_path
+
+    try:
+        img = Image.open(file_path)
+        img.thumbnail((_THUMB_SIZE, _THUMB_SIZE))
+        img = img.convert("RGB")
+        img.save(str(thumb_path), "JPEG", quality=80)
+    except Exception:
+        logger.warning("Failed to create thumbnail for %s, serving original", file_path.name)
+        return file_path
+
+    return thumb_path

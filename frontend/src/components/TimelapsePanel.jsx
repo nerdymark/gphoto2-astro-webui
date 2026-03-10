@@ -1,6 +1,6 @@
 import { useState } from "react";
 import * as api from "../api/client";
-import { imageUrl } from "../api/client";
+import { thumbnailUrl } from "../api/client";
 
 const RESOLUTIONS = [
   { label: "1080p (1920x1080)", value: "1920x1080" },
@@ -123,7 +123,7 @@ export default function TimelapsePanel({ gallery, images, onComplete }) {
                   }`}
                 >
                   <img
-                    src={imageUrl(gallery, img.filename)}
+                    src={thumbnailUrl(gallery, img.filename)}
                     alt={img.filename}
                     className="w-full h-full object-cover"
                   />

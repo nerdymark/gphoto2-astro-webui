@@ -97,3 +97,6 @@ export const cancelJob = (jobId) =>
 
 export const imageUrl = (gallery, filename) =>
   `${BASE}/api/images/${encodeURIComponent(gallery)}/${encodeURIComponent(filename)}`;
+
+export const thumbnailUrl = (gallery, filename) =>
+  `${BASE}/api/thumbnails/${encodeURIComponent(gallery)}/${encodeURIComponent(filename)}`;
