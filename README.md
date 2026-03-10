@@ -6,11 +6,25 @@ A Raspberry Pi-based camera controller web UI for astrophotography.
 
 - Camera detection via gphoto2 (MTP/PTP)
 - Manual exposure controls: aperture, shutter speed, ISO
-- Named gallery management – organize captures by session
+- Named gallery management -- organize captures by session
 - Burst capture with configurable interval
-- Image stacking for star photography (mean / median / sum modes)
+- Image stacking for star photography (mean / sum modes)
+- Background job system with live progress and log streaming
 - Built-in gallery viewer with lightbox and image download
 - SPA frontend (Vite + React + Tailwind CSS) served by FastAPI
+
+---
+
+## License
+
+This is a personal art project. **No open-source license is granted.**
+
+You are free to clone and run this software for personal use, but this
+repository is not open to outside contributions. Pull requests will not
+be accepted. This policy exists to prevent conflicts with the author's
+professional work.
+
+Copyright (c) 2024-2026 nerdymark. All rights reserved.
 
 ---
 
@@ -23,7 +37,7 @@ A Raspberry Pi-based camera controller web UI for astrophotography.
 
 ---
 
-## Quick start – Raspberry Pi
+## Quick start -- Raspberry Pi
 
 ```bash
 # 1. Clone the repository
@@ -48,12 +62,12 @@ chmod +x install.sh
 ```bash
 ./install.sh --dev
 
-# Terminal 1 – backend
+# Terminal 1 -- backend
 cd backend
 source .venv/bin/activate
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-# Terminal 2 – frontend dev server (proxies /api to :8000)
+# Terminal 2 -- frontend dev server (proxies /api to :8000)
 cd frontend
 npm run dev
 ```
@@ -92,6 +106,7 @@ npm run dev            # Vite dev server with API proxy
 |---|---|---|
 | `GALLERY_ROOT` | `./galleries` | Directory where captured images are stored |
 | `VITE_API_BASE` | `""` (same origin) | Override API base URL for frontend builds |
+| `LOG_LEVEL` | `INFO` | Backend logging verbosity |
 
 ---
 
@@ -102,26 +117,31 @@ gphoto2-astro-webui/
 ├── backend/
 │   ├── main.py          # FastAPI application & REST endpoints
 │   ├── camera.py        # gphoto2 wrapper (with simulation fallback)
-│   ├── stacking.py      # Image stacking (mean/median/sum)
+│   ├── stacking.py      # Image stacking (mean/sum)
+│   ├── jobs.py          # Background job manager
 │   ├── requirements.txt
 │   └── tests/
 │       └── test_backend.py
 ├── frontend/
 │   ├── src/
 │   │   ├── api/client.js          # Fetch-based API client
-│   │   ├── hooks/useCamera.js     # React hooks for camera/gallery state
+│   │   ├── hooks/
+│   │   │   ├── useCamera.js       # Camera/gallery state hooks
+│   │   │   └── useJobs.js         # Job polling hook
 │   │   ├── components/
 │   │   │   ├── StatusBadge.jsx
 │   │   │   ├── ExposureControls.jsx
 │   │   │   ├── GalleryManager.jsx
 │   │   │   ├── CapturePanel.jsx
 │   │   │   ├── StackingPanel.jsx
-│   │   │   └── GalleryViewer.jsx
+│   │   │   ├── GalleryViewer.jsx
+│   │   │   └── JobsPanel.jsx
 │   │   └── App.jsx
 │   ├── package.json
 │   └── vite.config.js
 ├── galleries/           # Auto-created; stores captured images
 ├── install.sh           # Raspberry Pi installer
+├── CLAUDE.md            # AI assistant instructions
 └── README.md
 ```
 
@@ -132,15 +152,20 @@ gphoto2-astro-webui/
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/camera/status` | Camera connection & summary |
+| `GET` | `/api/camera/config-keys` | List supported config keys |
 | `GET` | `/api/camera/exposure` | Current aperture / shutter / ISO + available choices |
 | `POST` | `/api/camera/exposure` | Set aperture / shutter / ISO |
 | `POST` | `/api/camera/capture` | Capture image into a gallery |
+| `POST` | `/api/camera/burst` | Start burst capture (returns job ID) |
 | `GET` | `/api/galleries` | List all galleries |
 | `POST` | `/api/galleries` | Create a gallery |
 | `GET` | `/api/galleries/{gallery}` | List images in a gallery |
 | `DELETE` | `/api/galleries/{gallery}/{filename}` | Delete an image |
-| `POST` | `/api/galleries/{gallery}/stack` | Stack selected images |
+| `POST` | `/api/galleries/{gallery}/stack` | Start image stacking (returns job ID) |
 | `GET` | `/api/images/{gallery}/{filename}` | Serve a gallery image |
+| `GET` | `/api/jobs` | List all jobs |
+| `GET` | `/api/jobs/{id}` | Get job status, progress, and log |
+| `POST` | `/api/jobs/{id}/cancel` | Cancel a running job |
 
 ---
 

@@ -1268,19 +1268,16 @@ class TestStackingModule:
         # Mean of 100 and 200 is 150 (JPEG compression adds ~±10 tolerance)
         assert abs(int(arr[0, 0, 0]) - 150) <= 15
 
-    def test_median_stack(self, tmp_path):
+    def test_invalid_mode_raises(self, tmp_path):
         import stacking
+        import pytest
 
         paths = [
             self._make_image(tmp_path, "a.jpg", (50, 50, 50)),
             self._make_image(tmp_path, "b.jpg", (100, 100, 100)),
-            self._make_image(tmp_path, "c.jpg", (200, 200, 200)),
         ]
-        result = stacking.stack_images(paths, mode="median")
-        import numpy as np
-
-        arr = np.array(result)
-        assert abs(int(arr[0, 0, 0]) - 100) <= 15
+        with pytest.raises(ValueError, match="Unknown stacking mode"):
+            stacking.stack_images(paths, mode="median")
 
     def test_sum_stack_normalized(self, tmp_path):
         import stacking

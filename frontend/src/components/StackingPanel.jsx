@@ -136,7 +136,6 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
                 disabled={submitting}
               >
                 <option value="mean">Mean (average)</option>
-                <option value="median">Median (noise rejection)</option>
                 <option value="sum">Sum (bright stars)</option>
               </select>
             </div>

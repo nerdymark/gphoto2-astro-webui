@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-gphoto2-astro-webui is a web-based astrophotography camera control application. It wraps the `gphoto2` CLI tool with a FastAPI backend and React frontend, designed primarily for Raspberry Pi deployments. Features include live camera control, burst capture, image stacking (mean/median/sum), and a gallery viewer.
+gphoto2-astro-webui is a web-based astrophotography camera control application. It wraps the `gphoto2` CLI tool with a FastAPI backend and React frontend, designed primarily for Raspberry Pi deployments. Features include live camera control, burst capture, image stacking (mean/sum), background job tracking, and a gallery viewer.
 
 ## Architecture
 
@@ -10,7 +10,7 @@ gphoto2-astro-webui is a web-based astrophotography camera control application. 
 backend/          # FastAPI REST API (Python 3.10+)
 ├── main.py       # API endpoints, static file serving, Pydantic models
 ├── camera.py     # gphoto2 CLI wrapper, USB conflict resolution, simulation fallback
-├── stacking.py   # NumPy-based image stacking (mean/median/sum)
+├── stacking.py   # NumPy-based image stacking (mean/sum)
 ├── requirements.txt
 └── tests/
     └── test_backend.py   # pytest test suite with mocked gphoto2
