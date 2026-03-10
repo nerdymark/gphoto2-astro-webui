@@ -9,6 +9,7 @@ A Raspberry Pi-based camera controller web UI for astrophotography.
 - Named gallery management -- organize captures by session
 - Burst capture with configurable interval
 - Image stacking for star photography (mean / sum modes)
+- Timelapse video generation (4K 60fps via ffmpeg)
 - Background job system with live progress and log streaming
 - Built-in gallery viewer with lightbox and image download
 - SPA frontend (Vite + React + Tailwind CSS) served by FastAPI
@@ -118,6 +119,7 @@ gphoto2-astro-webui/
 │   ├── main.py          # FastAPI application & REST endpoints
 │   ├── camera.py        # gphoto2 wrapper (with simulation fallback)
 │   ├── stacking.py      # Image stacking (mean/sum)
+│   ├── timelapse.py     # Timelapse video generation (ffmpeg)
 │   ├── jobs.py          # Background job manager
 │   ├── requirements.txt
 │   └── tests/
@@ -134,6 +136,7 @@ gphoto2-astro-webui/
 │   │   │   ├── GalleryManager.jsx
 │   │   │   ├── CapturePanel.jsx
 │   │   │   ├── StackingPanel.jsx
+│   │   │   ├── TimelapsePanel.jsx
 │   │   │   ├── GalleryViewer.jsx
 │   │   │   └── JobsPanel.jsx
 │   │   └── App.jsx
@@ -162,7 +165,9 @@ gphoto2-astro-webui/
 | `GET` | `/api/galleries/{gallery}` | List images in a gallery |
 | `DELETE` | `/api/galleries/{gallery}/{filename}` | Delete an image |
 | `POST` | `/api/galleries/{gallery}/stack` | Start image stacking (returns job ID) |
+| `POST` | `/api/galleries/{gallery}/timelapse` | Generate timelapse video (returns job ID) |
 | `GET` | `/api/images/{gallery}/{filename}` | Serve a gallery image |
+| `GET` | `/api/videos/{gallery}/{filename}` | Serve a gallery video |
 | `GET` | `/api/jobs` | List all jobs |
 | `GET` | `/api/jobs/{id}` | Get job status, progress, and log |
 | `POST` | `/api/jobs/{id}/cancel` | Cancel a running job |

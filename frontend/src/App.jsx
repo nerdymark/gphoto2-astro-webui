@@ -6,11 +6,11 @@ import StatusBadge from "./components/StatusBadge";
 import ExposureControls from "./components/ExposureControls";
 import GalleryManager from "./components/GalleryManager";
 import CapturePanel from "./components/CapturePanel";
-import StackingPanel from "./components/StackingPanel";
+import TimelapsePanel from "./components/TimelapsePanel";
 import GalleryViewer from "./components/GalleryViewer";
 import JobsPanel from "./components/JobsPanel";
 
-const TABS = ["Capture", "Gallery", "Stacking", "Jobs"];
+const TABS = ["Capture", "Gallery", "Timelapse", "Jobs"];
 
 export default function App() {
   const { status } = useCameraStatus();
@@ -119,11 +119,11 @@ export default function App() {
                 onRefresh={refreshImages}
               />
             )}
-            {tab === "Stacking" && (
-              <StackingPanel
+            {tab === "Timelapse" && (
+              <TimelapsePanel
                 gallery={selectedGallery}
                 images={images}
-                onStackComplete={handleCapture}
+                onComplete={handleCapture}
               />
             )}
             {tab === "Jobs" && (

@@ -12,7 +12,9 @@ Endpoints:
   POST /api/galleries            – create a new gallery
   GET  /api/galleries/{gallery}  – list images in a gallery
   POST /api/galleries/{gallery}/stack – start stacking (returns job)
+  POST /api/galleries/{gallery}/timelapse – generate timelapse video (returns job)
   GET  /api/images/{gallery}/{filename} – serve a gallery image
+  GET  /api/videos/{gallery}/{filename} – serve a gallery video
   GET  /api/jobs                 – list all jobs
   GET  /api/jobs/{job_id}        – get job status + log
   POST /api/jobs/{job_id}/cancel – cancel a running job
@@ -33,6 +35,7 @@ from pydantic import BaseModel
 
 import camera as cam
 import stacking as stk
+import timelapse as tl
 from jobs import jobs, JobStatus
 
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -84,6 +87,13 @@ class BurstRequest(BaseModel):
 class StackRequest(BaseModel):
     images: list[str]
     mode: str = "mean"
+    output_name: Optional[str] = None
+
+
+class TimelapseRequest(BaseModel):
+    images: list[str]
+    fps: int = 60
+    resolution: str = "3840x2160"
     output_name: Optional[str] = None
 
 
@@ -317,6 +327,78 @@ async def stack_gallery_images(gallery: str, req: StackRequest):
 
 
 # ---------------------------------------------------------------------------
+# Timelapse endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/galleries/{gallery}/timelapse", status_code=202)
+async def create_timelapse(gallery: str, req: TimelapseRequest):
+    """Generate a timelapse video from gallery images as a background job.
+
+    Returns 202 immediately with a job ID.
+    """
+    gallery_name = gallery
+    image_filenames = list(req.images)
+    fps = req.fps
+    resolution = req.resolution
+    output_name = req.output_name or f"timelapse-{fps}fps-{int(time.time())}.mp4"
+
+    job = jobs.create(
+        "timelapse",
+        total=len(image_filenames),
+        message=f"Timelapse {len(image_filenames)} images @ {fps}fps {resolution}",
+    )
+
+    def _run_timelapse():
+        jobs.start(job)
+        try:
+            gallery_dir = _resolve_gallery(gallery_name)
+            if gallery_dir is None:
+                raise ValueError(f"Gallery '{gallery_name}' not found")
+
+            paths = []
+            for fn in image_filenames:
+                p = gallery_dir / fn
+                if not p.exists():
+                    raise FileNotFoundError(f"Image not found: {fn}")
+                paths.append(p)
+
+            if len(paths) < 2:
+                raise ValueError("At least 2 images required for a timelapse")
+
+            job.log(f"Validated {len(paths)} images, generating {fps}fps {resolution} video")
+
+            def on_progress(processed, total):
+                jobs.update_progress(
+                    job, processed, f"Encoding frame {processed}/{total}"
+                )
+
+            output_path = gallery_dir / output_name
+            tl.generate_timelapse(
+                paths,
+                output_path,
+                fps=fps,
+                resolution=resolution,
+                on_progress=on_progress,
+                cancel_check=lambda: job.cancelled,
+            )
+
+            file_size_mb = output_path.stat().st_size / (1024 * 1024)
+            jobs.complete(job, {
+                "ok": True,
+                "gallery": gallery_name,
+                "filename": output_name,
+                "url": f"/api/videos/{gallery_name}/{output_name}",
+                "size_mb": round(file_size_mb, 1),
+            })
+        except Exception as exc:
+            jobs.fail(job, str(exc))
+
+    threading.Thread(target=_run_timelapse, daemon=True).start()
+    return {"job_id": job.id}
+
+
+# ---------------------------------------------------------------------------
 # Job tracking endpoints
 # ---------------------------------------------------------------------------
 
@@ -360,6 +442,15 @@ def serve_image(gallery: str, filename: str):
     if not file_path.exists() or not file_path.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(str(file_path))
+
+
+@app.get("/api/videos/{gallery}/{filename}")
+def serve_video(gallery: str, filename: str):
+    gallery_dir = _gallery_path(gallery)
+    file_path = gallery_dir / filename
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Video not found")
+    return FileResponse(str(file_path), media_type="video/mp4")
 
 
 # ---------------------------------------------------------------------------
