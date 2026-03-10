@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-gphoto2-astro-webui is a web-based astrophotography camera control application. It wraps the `gphoto2` CLI tool with a FastAPI backend and React frontend, designed primarily for Raspberry Pi deployments. Features include live camera control, burst capture, image stacking (mean/sum), background job tracking, and a gallery viewer.
+gphoto2-astro-webui is a web-based astrophotography camera control application. It wraps the `gphoto2` CLI tool with a FastAPI backend and React frontend, designed primarily for Raspberry Pi deployments. Features include live camera control, burst capture, image stacking (mean/sum), timelapse video generation (4K 60fps via ffmpeg), background job tracking, and a gallery viewer.
 
 ## Architecture
 
@@ -11,6 +11,7 @@ backend/          # FastAPI REST API (Python 3.10+)
 ├── main.py       # API endpoints, static file serving, Pydantic models
 ├── camera.py     # gphoto2 CLI wrapper, USB conflict resolution, simulation fallback
 ├── stacking.py   # NumPy-based image stacking (mean/sum)
+├── timelapse.py  # Timelapse video generation (ffmpeg subprocess)
 ├── requirements.txt
 └── tests/
     └── test_backend.py   # pytest test suite with mocked gphoto2
@@ -81,7 +82,8 @@ Tests use `unittest.mock` to mock gphoto2 subprocess calls. Test file: `backend/
 - **Bulb mode**: Camera detects Bulb/Time shutter-speed modes and uses the two-phase `epress2` (Nikon) or `bulb` (generic) capture sequence instead of `--capture-image-and-download`
 - **Config key fallbacks**: Nikon cameras use `f-number` instead of `aperture` and may use `shutterspeed2` instead of `shutterspeed`. The getter and setter both probe for the correct key.
 - **Path sanitization**: Gallery names are validated to allow only `[a-zA-Z0-9._\- ]`
-- **Pydantic models**: Used for request/response validation (`ExposureSettings`, `CaptureRequest`, `StackRequest`, `CreateGalleryRequest`)
+- **Pydantic models**: Used for request/response validation (`ExposureSettings`, `CaptureRequest`, `StackRequest`, `TimelapseRequest`, `CreateGalleryRequest`)
+- **Timelapse generation**: Uses ffmpeg subprocess to encode images into 4K 60fps MP4 videos. Concat demuxer approach handles arbitrary filenames. Runs as a background job.
 - **Image formats**: Supports .jpg, .jpeg, .png, .tif, .cr2, .nef, .arw
 
 ### Frontend (React/JSX)
@@ -113,7 +115,9 @@ Tests use `unittest.mock` to mock gphoto2 subprocess calls. Test file: `backend/
 | GET | `/api/galleries/{name}` | List images in gallery |
 | DELETE | `/api/galleries/{name}/{file}` | Delete image |
 | POST | `/api/galleries/{name}/stack` | Stack selected images |
+| POST | `/api/galleries/{name}/timelapse` | Generate timelapse video |
 | GET | `/api/images/{gallery}/{file}` | Serve image file |
+| GET | `/api/videos/{gallery}/{file}` | Serve video file |
 
 ## Known Issues and Troubleshooting (Nikon D780)
 

@@ -75,8 +75,19 @@ export const stackImages = (gallery, images, mode, outputName) =>
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ images, mode, output_name: outputName }),
-    timeout: 60000, // 60s – submit should be instant but GIL contention can delay response
+    timeout: 60000,
   });
+
+// Timelapse (returns job_id – ffmpeg runs in background)
+export const createTimelapse = (gallery, images, fps, resolution, outputName) =>
+  request(`/api/galleries/${encodeURIComponent(gallery)}/timelapse`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ images, fps, resolution, output_name: outputName }),
+  });
+
+export const videoUrl = (gallery, filename) =>
+  `${BASE}/api/videos/${encodeURIComponent(gallery)}/${encodeURIComponent(filename)}`;
 
 // Jobs
 export const getJob = (jobId) => request(`/api/jobs/${jobId}`);

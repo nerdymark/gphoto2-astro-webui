@@ -169,6 +169,7 @@ sudo apt-get install -y -qq \
     libjpeg-dev \
     zlib1g-dev \
     libopenblas0 \
+    ffmpeg \
     git \
     curl \
     gphoto2 \
