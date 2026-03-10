@@ -3,17 +3,17 @@ import * as api from "../api/client";
 import { imageUrl } from "../api/client";
 
 const RESOLUTIONS = [
-  { label: "4K (3840x2160)", value: "3840x2160" },
   { label: "1080p (1920x1080)", value: "1920x1080" },
   { label: "720p (1280x720)", value: "1280x720" },
+  { label: "4K (3840x2160)", value: "3840x2160" },
 ];
 
 const FPS_OPTIONS = [24, 30, 60];
 
 export default function TimelapsePanel({ gallery, images, onComplete }) {
   const [selected, setSelected] = useState(new Set());
-  const [fps, setFps] = useState(60);
-  const [resolution, setResolution] = useState("3840x2160");
+  const [fps, setFps] = useState(30);
+  const [resolution, setResolution] = useState("1920x1080");
   const [outputName, setOutputName] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(null);
