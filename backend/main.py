@@ -503,6 +503,10 @@ def _resolve_gallery(name: str) -> Optional[Path]:
     return p if p.exists() else None
 
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".cr2", ".cr3", ".nef", ".arw"}
+_VIDEO_EXTS = {".mp4", ".webm"}
+_MEDIA_EXTS = _IMAGE_EXTS | _VIDEO_EXTS
+
+
 def _list_images(directory: Path) -> list[str]:
-    exts = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".cr2", ".cr3", ".nef", ".arw"}
-    return sorted(f.name for f in directory.iterdir() if f.suffix.lower() in exts)
+    return sorted(f.name for f in directory.iterdir() if f.suffix.lower() in _MEDIA_EXTS)
