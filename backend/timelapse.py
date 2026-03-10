@@ -65,7 +65,8 @@ def generate_timelapse(
         output_path: Destination path for the output MP4 file.
         fps: Frames per second (default 60).
         resolution: Output resolution as "WxH" (default "1920x1080").
-        on_progress: Optional callback(frames_processed, total_frames).
+        on_progress: Optional callback(phase, frames_processed, total_frames).
+                     phase is "resize" or "encode".
         cancel_check: Optional callable returning True if job should abort.
 
     Returns:
@@ -112,8 +113,7 @@ def generate_timelapse(
             resized_paths.append(dst)
 
             if on_progress:
-                # Resize is ~40% of the work, encoding is ~60%
-                on_progress(0, total)
+                on_progress("resize", i + 1, total)
 
         logger.info("Pre-resize complete, building ffmpeg concat list")
 
@@ -180,7 +180,7 @@ def generate_timelapse(
                 try:
                     frames_done = int(line.split("=", 1)[1].strip())
                     if on_progress:
-                        on_progress(min(frames_done, total), total)
+                        on_progress("encode", min(frames_done, total), total)
                 except ValueError:
                     pass
 
@@ -195,7 +195,7 @@ def generate_timelapse(
 
         # Final progress
         if on_progress:
-            on_progress(total, total)
+            on_progress("encode", total, total)
 
         file_size_mb = output_path.stat().st_size / (1024 * 1024)
         logger.info("Timelapse saved: %s (%.1f MiB)", output_path.name, file_size_mb)

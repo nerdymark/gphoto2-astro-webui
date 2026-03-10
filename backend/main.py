@@ -374,10 +374,15 @@ async def create_timelapse(gallery: str, req: TimelapseRequest):
             job.log(f"Validated {len(paths)} images, generating {fps}fps {resolution} video")
             job.log(f"ffmpeg threads limited to {FFMPEG_THREADS}")
 
-            def on_progress(processed, total):
-                jobs.update_progress(
-                    job, processed, f"Encoding frame {processed}/{total}"
-                )
+            def on_progress(phase, processed, total):
+                if phase == "resize":
+                    jobs.update_progress(
+                        job, processed, f"Resizing image {processed}/{total}"
+                    )
+                else:
+                    jobs.update_progress(
+                        job, processed, f"Encoding frame {processed}/{total}"
+                    )
 
             output_path = gallery_dir / output_name
             tl.generate_timelapse(
