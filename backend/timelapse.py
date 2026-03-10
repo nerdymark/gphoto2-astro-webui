@@ -29,6 +29,7 @@ def generate_timelapse(
     output_path: Path,
     fps: int = 60,
     resolution: str = "3840x2160",
+    threads: int = 0,
     on_progress=None,
     cancel_check=None,
 ) -> Path:
@@ -109,8 +110,10 @@ def generate_timelapse(
             "-pix_fmt", "yuv420p",
             "-movflags", "+faststart",
             "-progress", "pipe:1",
-            str(output_path),
         ]
+        if threads > 0:
+            cmd.extend(["-threads", str(threads)])
+        cmd.append(str(output_path))
 
         logger.info("Running: %s", " ".join(cmd))
 

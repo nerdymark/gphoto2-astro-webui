@@ -36,7 +36,7 @@ from pydantic import BaseModel
 import camera as cam
 import stacking as stk
 import timelapse as tl
-from jobs import jobs, JobStatus
+from jobs import jobs, JobStatus, timelapse_semaphore, FFMPEG_THREADS
 
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 _level = getattr(logging, _LOG_LEVEL, logging.INFO)
@@ -350,6 +350,11 @@ async def create_timelapse(gallery: str, req: TimelapseRequest):
     )
 
     def _run_timelapse():
+        job.log(f"Waiting for timelapse slot (limit: 1 concurrent)…")
+        acquired = timelapse_semaphore.acquire(timeout=0)
+        if not acquired:
+            job.log("Another timelapse is running, queued…")
+            timelapse_semaphore.acquire()
         jobs.start(job)
         try:
             gallery_dir = _resolve_gallery(gallery_name)
@@ -367,6 +372,7 @@ async def create_timelapse(gallery: str, req: TimelapseRequest):
                 raise ValueError("At least 2 images required for a timelapse")
 
             job.log(f"Validated {len(paths)} images, generating {fps}fps {resolution} video")
+            job.log(f"ffmpeg threads limited to {FFMPEG_THREADS}")
 
             def on_progress(processed, total):
                 jobs.update_progress(
@@ -379,6 +385,7 @@ async def create_timelapse(gallery: str, req: TimelapseRequest):
                 output_path,
                 fps=fps,
                 resolution=resolution,
+                threads=FFMPEG_THREADS,
                 on_progress=on_progress,
                 cancel_check=lambda: job.cancelled,
             )
@@ -393,6 +400,8 @@ async def create_timelapse(gallery: str, req: TimelapseRequest):
             })
         except Exception as exc:
             jobs.fail(job, str(exc))
+        finally:
+            timelapse_semaphore.release()
 
     threading.Thread(target=_run_timelapse, daemon=True).start()
     return {"job_id": job.id}

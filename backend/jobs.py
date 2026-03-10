@@ -14,6 +14,7 @@ Design constraints (Raspberry Pi):
 """
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -23,6 +24,12 @@ from enum import Enum
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Semaphore that limits timelapse jobs to one at a time.
+timelapse_semaphore = threading.Semaphore(1)
+
+# Half the available CPUs (minimum 1) for ffmpeg thread limiting.
+FFMPEG_THREADS = max(1, os.cpu_count() // 2) if os.cpu_count() else 1
 
 # How many completed/failed jobs to keep for the frontend to query.
 _MAX_HISTORY = 50
