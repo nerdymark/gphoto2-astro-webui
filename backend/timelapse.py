@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -161,12 +162,26 @@ def generate_timelapse(
             text=True,
         )
 
+        # Drain stderr in a background thread to prevent pipe buffer
+        # deadlock.  ffmpeg writes status/errors to stderr; if the
+        # 64 KB pipe buffer fills while we're blocking on stdout
+        # readline, ffmpeg stalls and the job hangs forever.
+        stderr_lines: list[str] = []
+
+        def _drain_stderr():
+            for line in proc.stderr:
+                stderr_lines.append(line)
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
         # Parse ffmpeg progress output
         frames_done = 0
         while True:
             if cancel_check and cancel_check():
                 proc.kill()
                 proc.wait()
+                stderr_thread.join(timeout=5)
                 if output_path.exists():
                     output_path.unlink()
                 raise RuntimeError("Timelapse generation cancelled")
@@ -185,9 +200,10 @@ def generate_timelapse(
                     pass
 
         proc.wait()
+        stderr_thread.join(timeout=10)
 
         if proc.returncode != 0:
-            stderr = proc.stderr.read()
+            stderr = "".join(stderr_lines)
             logger.error("ffmpeg failed (rc=%d): %s", proc.returncode, stderr)
             if output_path.exists():
                 output_path.unlink()
