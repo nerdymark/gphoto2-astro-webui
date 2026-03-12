@@ -10,8 +10,10 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
   const [submitted, setSubmitted] = useState(null);
   const [error, setError] = useState(null);
 
-  // Filter out already-stacked images from selection candidates
-  const stackableImages = images.filter((img) => !img.filename.startsWith("stacked-"));
+  // Filter out already-stacked images and videos from selection candidates
+  const stackableImages = images.filter(
+    (img) => !img.filename.startsWith("stacked-") && !img.filename.toLowerCase().endsWith(".mp4") && !img.filename.toLowerCase().endsWith(".webm")
+  );
 
   const toggleImage = (filename) => {
     setSelected((prev) => {
