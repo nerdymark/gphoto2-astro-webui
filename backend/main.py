@@ -236,15 +236,23 @@ async def capture_burst(req: BurstRequest):
 def list_galleries():
     galleries = []
     for d in sorted(GALLERY_ROOT.iterdir()):
-        if d.is_dir():
-            images = _list_images(d)
-            galleries.append(
-                {
-                    "name": d.name,
-                    "image_count": len(images),
-                    "thumbnail": f"/api/thumbnails/{d.name}/{images[0]}" if images else None,
-                }
-            )
+        if not d.is_dir():
+            continue
+        # Skip hidden dirs, .thumbs caches, and system dirs like lost+found
+        if d.name.startswith(".") or d.name == "lost+found":
+            continue
+        # Only show dirs whose names pass gallery-name validation
+        safe = "".join(c for c in d.name if c.isalnum() or c in "._- ").strip()
+        if safe != d.name:
+            continue
+        images = _list_images(d)
+        galleries.append(
+            {
+                "name": d.name,
+                "image_count": len(images),
+                "thumbnail": f"/api/thumbnails/{d.name}/{images[0]}" if images else None,
+            }
+        )
     return {"galleries": galleries}
 
 
