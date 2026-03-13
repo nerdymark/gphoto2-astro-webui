@@ -80,12 +80,12 @@ if $SERVER_MODE; then
     source "${REPO_DIR}/server/.venv/bin/activate"
 
     info "Installing Python dependencies…"
-    pip install --upgrade pip -q
-    pip install -q -r "${REPO_DIR}/server/requirements.txt"
+    pip install --upgrade pip
+    pip install --progress-bar on -r "${REPO_DIR}/server/requirements.txt"
 
     # Try to install CUDA support (optional – won't fail if no GPU)
     info "Attempting to install cupy for CUDA acceleration (optional)…"
-    pip install -q cupy-cuda12x 2>/dev/null \
+    pip install cupy-cuda12x 2>/dev/null \
         && info "cupy installed – CUDA GPU acceleration enabled" \
         || warn "cupy not installed (no CUDA GPU or drivers) – falling back to CPU"
 
@@ -475,9 +475,27 @@ info "Setting up Python virtual environment…"
 python3 -m venv "${REPO_DIR}/backend/.venv"
 source "${REPO_DIR}/backend/.venv/bin/activate"
 
-info "Installing Python dependencies…"
-pip install --upgrade pip -q
-pip install -q -r "${REPO_DIR}/backend/requirements.txt"
+# On low-RAM Pis, /tmp is a tmpfs that can fill up during pip builds
+# (e.g. opencv-python-headless needs ~300 MiB temp space).  Use a
+# disk-backed temp directory under GALLERY_ROOT if /tmp is a tmpfs
+# with less than 512 MiB free.
+_PIP_ENV=()
+if findmnt -n -o FSTYPE /tmp 2>/dev/null | grep -q tmpfs; then
+    _tmp_avail=$(df --output=avail -BM /tmp 2>/dev/null | tail -1 | tr -dc '0-9')
+    if [[ -n "$_tmp_avail" ]] && (( _tmp_avail < 512 )); then
+        _pip_tmp="${REPO_DIR}/.pip-tmp"
+        mkdir -p "$_pip_tmp"
+        warn "/tmp is tmpfs with only ${_tmp_avail}M free – using ${_pip_tmp} for pip builds"
+        _PIP_ENV=(env "TMPDIR=${_pip_tmp}")
+    fi
+fi
+
+info "Installing Python dependencies (this may take a few minutes on Pi)…"
+"${_PIP_ENV[@]}" pip install --upgrade pip
+"${_PIP_ENV[@]}" pip install --progress-bar on -r "${REPO_DIR}/backend/requirements.txt"
+
+# Clean up disk-backed temp directory
+[[ -d "${REPO_DIR}/.pip-tmp" ]] && rm -rf "${REPO_DIR}/.pip-tmp"
 
 deactivate
 
