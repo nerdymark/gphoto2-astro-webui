@@ -525,6 +525,10 @@ if [[ ! -f "$ENV_FILE" ]]; then
 # Edit this file to customise the service, then restart:
 #   sudo systemctl restart gphoto2-astro-webui
 
+# Directory where galleries (captured images) are stored.
+# Uncomment and change to use an external drive or different path.
+#GALLERY_ROOT=/mnt/photos
+
 # Log level for the application and uvicorn (debug, info, warning, error, critical).
 # Change to "debug" for verbose logging.
 LOG_LEVEL=info
