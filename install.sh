@@ -80,12 +80,12 @@ if $SERVER_MODE; then
     source "${REPO_DIR}/server/.venv/bin/activate"
 
     info "Installing Python dependencies…"
-    pip install --upgrade pip -q
-    pip install -q -r "${REPO_DIR}/server/requirements.txt"
+    pip install --upgrade pip
+    pip install --progress-bar on -r "${REPO_DIR}/server/requirements.txt"
 
     # Try to install CUDA support (optional – won't fail if no GPU)
     info "Attempting to install cupy for CUDA acceleration (optional)…"
-    pip install -q cupy-cuda12x 2>/dev/null \
+    pip install cupy-cuda12x 2>/dev/null \
         && info "cupy installed – CUDA GPU acceleration enabled" \
         || warn "cupy not installed (no CUDA GPU or drivers) – falling back to CPU"
 
@@ -490,9 +490,9 @@ if findmnt -n -o FSTYPE /tmp 2>/dev/null | grep -q tmpfs; then
     fi
 fi
 
-info "Installing Python dependencies…"
-"${_PIP_ENV[@]}" pip install --upgrade pip -q
-"${_PIP_ENV[@]}" pip install -q -r "${REPO_DIR}/backend/requirements.txt"
+info "Installing Python dependencies (this may take a few minutes on Pi)…"
+"${_PIP_ENV[@]}" pip install --upgrade pip
+"${_PIP_ENV[@]}" pip install --progress-bar on -r "${REPO_DIR}/backend/requirements.txt"
 
 # Clean up disk-backed temp directory
 [[ -d "${REPO_DIR}/.pip-tmp" ]] && rm -rf "${REPO_DIR}/.pip-tmp"
