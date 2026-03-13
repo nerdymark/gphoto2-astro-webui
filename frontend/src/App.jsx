@@ -2,6 +2,7 @@ import { useState } from "react";
 import "./App.css";
 import { useCameraStatus, useGalleries, useGallery } from "./hooks/useCamera";
 import { useJobs } from "./hooks/useJobs";
+import { useRemoteStatus } from "./hooks/useRemote";
 import StatusBadge from "./components/StatusBadge";
 import ExposureControls from "./components/ExposureControls";
 import GalleryManager from "./components/GalleryManager";
@@ -20,6 +21,7 @@ export default function App() {
   const { images, refresh: refreshImages } = useGallery(selectedGallery);
   const [tab, setTab] = useState("Capture");
   const { jobsList, activeJobDetail, hasActiveJobs, cancelJob, refresh: refreshJobs } = useJobs();
+  const remoteStatus = useRemoteStatus();
 
   const handleCapture = () => {
     refreshImages();
@@ -125,6 +127,7 @@ export default function App() {
                 gallery={selectedGallery}
                 images={images}
                 onStackComplete={handleCapture}
+                remoteStatus={remoteStatus}
               />
             )}
             {tab === "Timelapse" && (
@@ -132,6 +135,7 @@ export default function App() {
                 gallery={selectedGallery}
                 images={images}
                 onComplete={handleCapture}
+                remoteStatus={remoteStatus}
               />
             )}
             {tab === "Jobs" && (

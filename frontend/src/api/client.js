@@ -70,21 +70,24 @@ export const deleteImage = (gallery, filename) =>
   });
 
 // Stacking (returns job_id – actual work happens in background)
-export const stackImages = (gallery, images, mode, outputName) =>
+export const stackImages = (gallery, images, mode, outputName, useRemote = false) =>
   request(`/api/galleries/${encodeURIComponent(gallery)}/stack`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ images, mode, output_name: outputName }),
+    body: JSON.stringify({ images, mode, output_name: outputName, remote: useRemote }),
     timeout: 60000,
   });
 
 // Timelapse (returns job_id – ffmpeg runs in background)
-export const createTimelapse = (gallery, images, fps, resolution, outputName) =>
+export const createTimelapse = (gallery, images, fps, resolution, outputName, useRemote = false) =>
   request(`/api/galleries/${encodeURIComponent(gallery)}/timelapse`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ images, fps, resolution, output_name: outputName }),
+    body: JSON.stringify({ images, fps, resolution, output_name: outputName, remote: useRemote }),
   });
+
+// Remote processing
+export const getRemoteStatus = () => request("/api/remote/status", { timeout: 8000 });
 
 export const videoUrl = (gallery, filename) =>
   `${BASE}/api/videos/${encodeURIComponent(gallery)}/${encodeURIComponent(filename)}`;
