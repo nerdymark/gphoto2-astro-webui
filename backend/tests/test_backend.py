@@ -1279,19 +1279,21 @@ class TestStackingModule:
         with pytest.raises(ValueError, match="Unknown stacking mode"):
             stacking.stack_images(paths, mode="median")
 
-    def test_sum_stack_normalized(self, tmp_path):
+    def test_max_stack_brightest_pixel(self, tmp_path):
         import stacking
 
         paths = [
-            self._make_image(tmp_path, "a.jpg", (100, 100, 100)),
-            self._make_image(tmp_path, "b.jpg", (100, 100, 100)),
+            self._make_image(tmp_path, "a.jpg", (50, 50, 50)),
+            self._make_image(tmp_path, "b.jpg", (200, 100, 100)),
         ]
-        result = stacking.stack_images(paths, mode="sum")
+        result = stacking.stack_images(paths, mode="max")
         import numpy as np
 
         arr = np.array(result)
-        # Sum mode normalises to 255 max
-        assert arr.max() == 255
+        # Max mode keeps the brightest pixel at each position
+        assert arr[:, :, 0].max() == 200
+        assert arr[:, :, 1].max() == 100
+        assert arr[:, :, 2].max() == 100
 
     def test_requires_at_least_two_images(self, tmp_path):
         import stacking

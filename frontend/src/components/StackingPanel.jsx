@@ -137,8 +137,9 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
                 onChange={(e) => setMode(e.target.value)}
                 disabled={submitting}
               >
-                <option value="mean">Mean (average)</option>
-                <option value="sum">Sum (bright stars)</option>
+                <option value="mean">Mean (noise reduction)</option>
+                <option value="max">Max (star trails)</option>
+                <option value="align+mean">Aligned Mean (drift correction)</option>
               </select>
             </div>
             <div className="flex flex-col gap-1">

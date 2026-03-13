@@ -277,6 +277,8 @@ async def stack_gallery_images(gallery: str, req: StackRequest):
     gallery_name = gallery
     image_filenames = list(req.images)
     mode = req.mode
+    if mode not in ("mean", "max", "align+mean"):
+        raise HTTPException(status_code=400, detail=f"Unknown stacking mode: {mode!r}")
     output_name = req.output_name or f"stacked-{mode}-{int(time.time())}.jpg"
 
     job = jobs.create(
