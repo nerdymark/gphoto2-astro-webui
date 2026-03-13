@@ -343,6 +343,165 @@ def process_remote(
         raise
 
 
+def create_remote_job(
+    job_type: str,
+    mode: str = "mean",
+    fps: int = 30,
+    resolution: str = "1920x1080",
+    output_name: Optional[str] = None,
+) -> str:
+    """Create a remote processing job and return its job_id.
+
+    Used by burst capture to pre-create the job so images can be streamed
+    as they are captured.
+    """
+    if not REMOTE_SERVER:
+        raise RuntimeError("Remote server not configured")
+
+    create_body = json.dumps({
+        "type": job_type,
+        "mode": mode,
+        "fps": fps,
+        "resolution": resolution,
+        "output_name": output_name,
+    }).encode()
+
+    resp_body = _request_with_retry(
+        f"{REMOTE_SERVER}/api/jobs",
+        method="POST",
+        data=create_body,
+        headers={"Content-Type": "application/json"},
+        timeout=30,
+    )
+    data = json.loads(resp_body)
+    job_id = data["job_id"]
+    logger.info("Remote job %s created (type=%s)", job_id, job_type)
+    return job_id
+
+
+def upload_single_image(job_id: str, image_path: Path):
+    """Upload a single image to an existing remote job.
+
+    Used during burst capture to stream images as they are captured,
+    overlapping network transfer with camera capture.
+    """
+    _upload_batch_with_retry(job_id, [image_path])
+
+
+def finalize_and_download(
+    job_id: str,
+    job_type: str = "stack",
+    output_name: Optional[str] = None,
+    output_dir: Optional[Path] = None,
+    on_progress=None,
+    cancel_check=None,
+) -> Path:
+    """Finalize a remote job that already has images uploaded, poll for
+    completion, and download the result.
+
+    This is the second half of process_remote(), used when images were
+    streamed during burst capture rather than batch-uploaded.
+    """
+    if not REMOTE_SERVER:
+        raise RuntimeError("Remote server not configured")
+
+    def _log_retry(attempt, wait, exc):
+        logger.info("Retry %d: waiting %.0fs after %s", attempt, wait, exc)
+
+    # Finalize
+    if cancel_check and cancel_check():
+        _cancel_remote(job_id)
+        raise RuntimeError("Cancelled")
+
+    _request_with_retry(
+        f"{REMOTE_SERVER}/api/jobs/{job_id}/finalize",
+        method="POST",
+        timeout=30,
+        on_retry=_log_retry,
+    )
+
+    # Poll for completion
+    consecutive_failures = 0
+    poll_backoff = INITIAL_BACKOFF
+
+    while True:
+        if cancel_check and cancel_check():
+            _cancel_remote(job_id)
+            raise RuntimeError("Cancelled")
+
+        time.sleep(1)
+
+        try:
+            resp_body = _request_with_retry(
+                f"{REMOTE_SERVER}/api/jobs/{job_id}",
+                method="GET",
+                timeout=10,
+                max_retries=2,
+            )
+            status = json.loads(resp_body)
+            consecutive_failures = 0
+            poll_backoff = INITIAL_BACKOFF
+        except Exception as exc:
+            consecutive_failures += 1
+            if consecutive_failures > MAX_RETRIES:
+                raise RuntimeError(
+                    f"Lost connection to remote server after {consecutive_failures} "
+                    f"poll failures: {exc}"
+                ) from exc
+
+            wait = min(poll_backoff, MAX_BACKOFF)
+            logger.warning(
+                "Remote job %s: poll failed (%d/%d): %s — retrying in %.0fs",
+                job_id, consecutive_failures, MAX_RETRIES, exc, wait,
+            )
+            if on_progress:
+                on_progress("reconnecting", consecutive_failures, MAX_RETRIES)
+            time.sleep(wait)
+            poll_backoff *= 2
+            continue
+
+        if on_progress and status.get("progress"):
+            on_progress("processing", status["progress"], status.get("total", 1))
+
+        if status["status"] == "completed":
+            break
+        elif status["status"] in ("failed", "cancelled"):
+            raise RuntimeError(
+                f"Remote job failed: {status.get('error', 'unknown')}"
+            )
+
+    # Download result
+    if on_progress:
+        on_progress("download", 0, 1)
+
+    result_url = f"{REMOTE_SERVER}/api/jobs/{job_id}/result"
+    if not output_name:
+        ext = ".mp4" if job_type == "timelapse" else ".jpg"
+        output_name = f"remote-{job_type}-{int(time.time())}{ext}"
+    output_path = (output_dir or Path(".")) / output_name
+
+    resp_body = _request_with_retry(
+        result_url,
+        method="GET",
+        timeout=600,
+        max_retries=MAX_RETRIES,
+        on_retry=_log_retry,
+    )
+    output_path.write_bytes(resp_body)
+
+    if on_progress:
+        on_progress("download", 1, 1)
+
+    logger.info("Remote job %s result saved to %s", job_id, output_path)
+
+    try:
+        _delete_remote(job_id)
+    except Exception:
+        pass
+
+    return output_path
+
+
 def _upload_batch_with_retry(job_id: str, paths: list[Path], on_retry=None):
     """Upload a batch of images with retry on transient network errors.
 
