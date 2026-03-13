@@ -45,7 +45,10 @@ function LogScroll({ lines }) {
   return (
     <div className="bg-slate-950 rounded-lg border border-slate-700 p-2 max-h-48 overflow-y-auto font-mono text-xs text-slate-400 space-y-0.5">
       {lines.map((line, i) => (
-        <div key={i} className={line.includes("FAILED") || line.includes("ERROR") ? "text-red-400" : ""}>
+        <div key={i} className={
+          line.includes("FAILED") || line.includes("ERROR") ? "text-red-400" :
+          line.includes("retry") || line.includes("Retry") || line.includes("reconnect") ? "text-amber-400" : ""
+        }>
           {line}
         </div>
       ))}
@@ -111,7 +114,14 @@ export default function JobsPanel({ jobsList, activeJobDetail, onCancel }) {
               </div>
 
               {/* Message */}
-              <p className="text-xs text-slate-300">{job.message}</p>
+              {(() => {
+                const isReconnecting = job.message && job.message.toLowerCase().startsWith("reconnecting");
+                return (
+                  <p className={`text-xs ${isReconnecting ? "text-amber-400 animate-pulse" : "text-slate-300"}`}>
+                    {isReconnecting ? `⚠ ${job.message} — WiFi interrupted, retrying…` : job.message}
+                  </p>
+                );
+              })()}
 
               {/* Progress bar */}
               {isActive && job.total > 0 && (
@@ -122,7 +132,11 @@ export default function JobsPanel({ jobsList, activeJobDetail, onCancel }) {
                   </div>
                   <div className="h-1.5 bg-slate-700 rounded-full overflow-hidden">
                     <div
-                      className="h-full bg-blue-500 rounded-full transition-all duration-500"
+                      className={`h-full rounded-full transition-all duration-500 ${
+                        job.message && job.message.toLowerCase().startsWith("reconnecting")
+                          ? "bg-amber-500 animate-pulse"
+                          : "bg-blue-500"
+                      }`}
                       style={{ width: `${(job.progress / job.total) * 100}%` }}
                     />
                   </div>
