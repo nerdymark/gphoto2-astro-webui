@@ -10,14 +10,17 @@ const RESOLUTIONS = [
 
 const FPS_OPTIONS = [24, 30, 60];
 
-export default function TimelapsePanel({ gallery, images, onComplete }) {
+export default function TimelapsePanel({ gallery, images, onComplete, remoteStatus }) {
   const [selected, setSelected] = useState(new Set());
   const [fps, setFps] = useState(30);
   const [resolution, setResolution] = useState("1920x1080");
   const [outputName, setOutputName] = useState("");
+  const [useRemote, setUseRemote] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(null);
   const [error, setError] = useState(null);
+
+  const remoteAvailable = remoteStatus?.configured && remoteStatus?.reachable;
 
   // Filter to image files only (exclude videos)
   const timelapseImages = images.filter(
@@ -47,7 +50,8 @@ export default function TimelapsePanel({ gallery, images, onComplete }) {
         Array.from(selected),
         fps,
         resolution,
-        outputName.trim() || undefined
+        outputName.trim() || undefined,
+        useRemote
       );
       setSubmitted(job_id);
       onComplete?.();
@@ -189,6 +193,26 @@ export default function TimelapsePanel({ gallery, images, onComplete }) {
             </div>
           </div>
 
+          {remoteAvailable && (
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input
+                type="checkbox"
+                checked={useRemote}
+                onChange={(e) => setUseRemote(e.target.checked)}
+                disabled={submitting}
+                className="rounded border-slate-600 bg-slate-700 text-indigo-500 focus:ring-indigo-500"
+              />
+              <span className="text-slate-300">
+                Process on remote server
+              </span>
+              {remoteStatus?.cuda && (
+                <span className="text-xs text-green-400 font-medium px-1.5 py-0.5 bg-green-900/30 rounded">
+                  NVENC
+                </span>
+              )}
+            </label>
+          )}
+
           <button
             onClick={handleGenerate}
             disabled={submitting || selected.size < 2}
@@ -196,7 +220,7 @@ export default function TimelapsePanel({ gallery, images, onComplete }) {
           >
             {submitting
               ? "Submitting..."
-              : `Generate Timelapse (${selected.size} frame${selected.size !== 1 ? "s" : ""})`}
+              : `Generate Timelapse (${selected.size} frame${selected.size !== 1 ? "s" : ""})${useRemote ? " (Remote)" : ""}`}
           </button>
 
           {submitted && (

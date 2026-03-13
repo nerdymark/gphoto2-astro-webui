@@ -2,13 +2,16 @@ import { useState } from "react";
 import * as api from "../api/client";
 import { thumbnailUrl } from "../api/client";
 
-export default function StackingPanel({ gallery, images, onStackComplete }) {
+export default function StackingPanel({ gallery, images, onStackComplete, remoteStatus }) {
   const [selected, setSelected] = useState(new Set());
   const [mode, setMode] = useState("mean");
   const [outputName, setOutputName] = useState("");
+  const [useRemote, setUseRemote] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [submitted, setSubmitted] = useState(null);
   const [error, setError] = useState(null);
+
+  const remoteAvailable = remoteStatus?.configured && remoteStatus?.reachable;
 
   // Filter out already-stacked images and videos from selection candidates
   const stackableImages = images.filter(
@@ -37,7 +40,8 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
         gallery,
         Array.from(selected),
         mode,
-        outputName.trim() || undefined
+        outputName.trim() || undefined,
+        useRemote
       );
       setSubmitted(job_id);
       onStackComplete?.();
@@ -156,6 +160,26 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
             </div>
           </div>
 
+          {remoteAvailable && (
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input
+                type="checkbox"
+                checked={useRemote}
+                onChange={(e) => setUseRemote(e.target.checked)}
+                disabled={submitting}
+                className="rounded border-slate-600 bg-slate-700 text-indigo-500 focus:ring-indigo-500"
+              />
+              <span className="text-slate-300">
+                Process on remote server
+              </span>
+              {remoteStatus?.cuda && (
+                <span className="text-xs text-green-400 font-medium px-1.5 py-0.5 bg-green-900/30 rounded">
+                  CUDA
+                </span>
+              )}
+            </label>
+          )}
+
           <button
             onClick={handleStack}
             disabled={submitting || selected.size < 2}
@@ -163,7 +187,7 @@ export default function StackingPanel({ gallery, images, onStackComplete }) {
           >
             {submitting
               ? "Submitting…"
-              : `Stack ${selected.size} Image${selected.size !== 1 ? "s" : ""}`}
+              : `Stack ${selected.size} Image${selected.size !== 1 ? "s" : ""}${useRemote ? " (Remote)" : ""}`}
           </button>
 
           {submitted && (

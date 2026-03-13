@@ -36,6 +36,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import camera as cam
+import remote
 import stacking as stk
 import timelapse as tl
 from jobs import jobs, JobStatus, timelapse_semaphore, FFMPEG_THREADS
@@ -90,6 +91,7 @@ class StackRequest(BaseModel):
     images: list[str]
     mode: str = "mean"
     output_name: Optional[str] = None
+    remote: bool = False
 
 
 class TimelapseRequest(BaseModel):
@@ -97,10 +99,30 @@ class TimelapseRequest(BaseModel):
     fps: int = 30
     resolution: str = "1920x1080"
     output_name: Optional[str] = None
+    remote: bool = False
 
 
 class CreateGalleryRequest(BaseModel):
     name: str
+
+
+# ---------------------------------------------------------------------------
+# Remote processing status
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/remote/status")
+def remote_status():
+    """Check if remote processing server is configured and reachable."""
+    if not remote.is_configured():
+        return {"configured": False, "server": None}
+    health = remote.health_check()
+    return {
+        "configured": True,
+        "server": remote.REMOTE_SERVER,
+        "reachable": health is not None,
+        "cuda": health.get("cuda", False) if health else False,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -277,25 +299,28 @@ async def stack_gallery_images(gallery: str, req: StackRequest):
     gallery_name = gallery
     image_filenames = list(req.images)
     mode = req.mode
+    use_remote = req.remote and remote.is_configured()
     if mode not in ("mean", "max", "align+mean"):
         raise HTTPException(status_code=400, detail=f"Unknown stacking mode: {mode!r}")
     output_name = req.output_name or f"stacked-{mode}-{int(time.time())}.jpg"
 
+    label = f"Stacking {len(image_filenames)} images ({mode})"
+    if use_remote:
+        label += f" [remote: {remote.REMOTE_SERVER}]"
+
     job = jobs.create(
         "stack",
         total=len(image_filenames),
-        message=f"Stacking {len(image_filenames)} images ({mode})",
+        message=label,
     )
 
     def _run_stack():
         jobs.start(job)
         try:
-            # Validate gallery exists.
             gallery_dir = _resolve_gallery(gallery_name)
             if gallery_dir is None:
                 raise ValueError(f"Gallery '{gallery_name}' not found")
 
-            # Validate image files exist.
             paths = []
             for fn in image_filenames:
                 p = gallery_dir / fn
@@ -306,23 +331,49 @@ async def stack_gallery_images(gallery: str, req: StackRequest):
             if len(paths) < 2:
                 raise ValueError("At least 2 images required for stacking")
 
-            job.log(f"Validated {len(paths)} images, starting {mode} stack")
+            if use_remote:
+                job.log(f"Sending {len(paths)} images to remote server")
 
-            def on_progress(processed, total):
-                jobs.update_progress(
-                    job, processed, f"Processing image {processed}/{total}"
+                def on_progress(phase, processed, total):
+                    jobs.update_progress(
+                        job, processed,
+                        f"{phase.capitalize()}: {processed}/{total}"
+                    )
+
+                result_path = remote.process_remote(
+                    job_type="stack",
+                    image_paths=paths,
+                    mode=mode,
+                    output_name=output_name,
+                    output_dir=gallery_dir,
+                    on_progress=on_progress,
+                    cancel_check=lambda: job.cancelled,
                 )
+                jobs.complete(job, {
+                    "ok": True,
+                    "gallery": gallery_name,
+                    "filename": result_path.name,
+                    "url": f"/api/images/{gallery_name}/{result_path.name}",
+                    "remote": True,
+                })
+            else:
+                job.log(f"Validated {len(paths)} images, starting {mode} stack")
 
-            result_image = stk.stack_images(paths, mode=mode, on_progress=on_progress)
-            output_path = gallery_dir / output_name
-            job.log(f"Saving result to {output_name}")
-            result_image.save(str(output_path), format="JPEG", quality=95)
-            jobs.complete(job, {
-                "ok": True,
-                "gallery": gallery_name,
-                "filename": output_name,
-                "url": f"/api/images/{gallery_name}/{output_name}",
-            })
+                def on_progress(processed, total):
+                    jobs.update_progress(
+                        job, processed, f"Processing image {processed}/{total}"
+                    )
+
+                result_image = stk.stack_images(paths, mode=mode, on_progress=on_progress)
+                output_path = gallery_dir / output_name
+                job.log(f"Saving result to {output_name}")
+                result_image.save(str(output_path), format="JPEG", quality=95)
+                jobs.complete(job, {
+                    "ok": True,
+                    "gallery": gallery_name,
+                    "filename": output_name,
+                    "url": f"/api/images/{gallery_name}/{output_name}",
+                })
         except Exception as exc:
             jobs.fail(job, str(exc))
 
@@ -345,20 +396,26 @@ async def create_timelapse(gallery: str, req: TimelapseRequest):
     image_filenames = list(req.images)
     fps = req.fps
     resolution = req.resolution
+    use_remote = req.remote and remote.is_configured()
     output_name = req.output_name or f"timelapse-{fps}fps-{int(time.time())}.mp4"
+
+    label = f"Timelapse {len(image_filenames)} images @ {fps}fps {resolution}"
+    if use_remote:
+        label += f" [remote: {remote.REMOTE_SERVER}]"
 
     job = jobs.create(
         "timelapse",
         total=len(image_filenames),
-        message=f"Timelapse {len(image_filenames)} images @ {fps}fps {resolution}",
+        message=label,
     )
 
     def _run_timelapse():
-        job.log(f"Waiting for timelapse slot (limit: 1 concurrent)…")
-        acquired = timelapse_semaphore.acquire(timeout=0)
-        if not acquired:
-            job.log("Another timelapse is running, queued…")
-            timelapse_semaphore.acquire()
+        if not use_remote:
+            job.log("Waiting for timelapse slot (limit: 1 concurrent)…")
+            acquired = timelapse_semaphore.acquire(timeout=0)
+            if not acquired:
+                job.log("Another timelapse is running, queued…")
+                timelapse_semaphore.acquire()
         jobs.start(job)
         try:
             gallery_dir = _resolve_gallery(gallery_name)
@@ -375,42 +432,72 @@ async def create_timelapse(gallery: str, req: TimelapseRequest):
             if len(paths) < 2:
                 raise ValueError("At least 2 images required for a timelapse")
 
-            job.log(f"Validated {len(paths)} images, generating {fps}fps {resolution} video")
-            job.log(f"ffmpeg threads limited to {FFMPEG_THREADS}")
+            if use_remote:
+                job.log(f"Sending {len(paths)} images to remote server")
 
-            def on_progress(phase, processed, total):
-                if phase == "resize":
+                def on_progress(phase, processed, total):
                     jobs.update_progress(
-                        job, processed, f"Resizing image {processed}/{total}"
-                    )
-                else:
-                    jobs.update_progress(
-                        job, processed, f"Encoding frame {processed}/{total}"
+                        job, processed,
+                        f"{phase.capitalize()}: {processed}/{total}"
                     )
 
-            output_path = gallery_dir / output_name
-            tl.generate_timelapse(
-                paths,
-                output_path,
-                fps=fps,
-                resolution=resolution,
-                threads=FFMPEG_THREADS,
-                on_progress=on_progress,
-                cancel_check=lambda: job.cancelled,
-            )
+                result_path = remote.process_remote(
+                    job_type="timelapse",
+                    image_paths=paths,
+                    fps=fps,
+                    resolution=resolution,
+                    output_name=output_name,
+                    output_dir=gallery_dir,
+                    on_progress=on_progress,
+                    cancel_check=lambda: job.cancelled,
+                )
+                file_size_mb = result_path.stat().st_size / (1024 * 1024)
+                jobs.complete(job, {
+                    "ok": True,
+                    "gallery": gallery_name,
+                    "filename": result_path.name,
+                    "url": f"/api/videos/{gallery_name}/{result_path.name}",
+                    "size_mb": round(file_size_mb, 1),
+                    "remote": True,
+                })
+            else:
+                job.log(f"Validated {len(paths)} images, generating {fps}fps {resolution} video")
+                job.log(f"ffmpeg threads limited to {FFMPEG_THREADS}")
 
-            file_size_mb = output_path.stat().st_size / (1024 * 1024)
-            jobs.complete(job, {
-                "ok": True,
-                "gallery": gallery_name,
-                "filename": output_name,
-                "url": f"/api/videos/{gallery_name}/{output_name}",
-                "size_mb": round(file_size_mb, 1),
-            })
+                def on_progress(phase, processed, total):
+                    if phase == "resize":
+                        jobs.update_progress(
+                            job, processed, f"Resizing image {processed}/{total}"
+                        )
+                    else:
+                        jobs.update_progress(
+                            job, processed, f"Encoding frame {processed}/{total}"
+                        )
+
+                output_path = gallery_dir / output_name
+                tl.generate_timelapse(
+                    paths,
+                    output_path,
+                    fps=fps,
+                    resolution=resolution,
+                    threads=FFMPEG_THREADS,
+                    on_progress=on_progress,
+                    cancel_check=lambda: job.cancelled,
+                )
+
+                file_size_mb = output_path.stat().st_size / (1024 * 1024)
+                jobs.complete(job, {
+                    "ok": True,
+                    "gallery": gallery_name,
+                    "filename": output_name,
+                    "url": f"/api/videos/{gallery_name}/{output_name}",
+                    "size_mb": round(file_size_mb, 1),
+                })
         except Exception as exc:
             jobs.fail(job, str(exc))
         finally:
-            timelapse_semaphore.release()
+            if not use_remote:
+                timelapse_semaphore.release()
 
     threading.Thread(target=_run_timelapse, daemon=True).start()
     return {"job_id": job.id}

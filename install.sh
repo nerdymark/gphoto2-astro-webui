@@ -4,9 +4,13 @@
 #
 # Usage:
 #   chmod +x install.sh
-#   ./install.sh [--dev]
+#   ./install.sh [--dev] [--server]
 #
-# What it does:
+# Modes:
+#   (default)  Install the Raspberry Pi camera controller (backend + frontend)
+#   --server   Install the remote GPU processing server on port 8069
+#
+# What the default (Pi) mode does:
 #   1. Installs gphoto2, libgphoto2-6(t64), and libgphoto2-port12(t64) from
 #      the distro package repository.  The correct package name variant is
 #      detected automatically: Bookworm uses the 't64' suffix for the 64-bit
@@ -25,9 +29,10 @@
 #   8. Optionally configures nginx as a reverse proxy
 #
 # Options:
-#   --dev  Development mode: skips nginx and does not start the service.
-#   --yes  Non-interactive: automatically remove a locally-built gphoto2
-#          without prompting (useful when running the script unattended).
+#   --dev     Development mode: skips nginx and does not start the service.
+#   --server  Install remote processing server instead of Pi camera controller.
+#   --yes     Non-interactive: automatically remove a locally-built gphoto2
+#             without prompting (useful when running the script unattended).
 # =============================================================================
 
 set -euo pipefail
@@ -44,13 +49,112 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEV_MODE=false
 YES_MODE=false
+SERVER_MODE=false
 
 for arg in "$@"; do
   case "$arg" in
     --dev) DEV_MODE=true ;;
     --yes|-y) YES_MODE=true ;;
+    --server) SERVER_MODE=true ;;
   esac
 done
+
+# ---------------------------------------------------------------------------
+# Server mode: install the remote processing server and exit
+# ---------------------------------------------------------------------------
+if $SERVER_MODE; then
+    info "Installing remote processing server…"
+
+    # System dependencies
+    sudo apt-get update -qq
+    info "Installing system packages (python3, ffmpeg)…"
+    sudo apt-get install -y -qq \
+        python3 \
+        python3-pip \
+        python3-venv \
+        libturbojpeg0 \
+        libjpeg-dev \
+        zlib1g-dev \
+        libopenblas0 \
+        ffmpeg
+
+    # Python virtual environment
+    info "Setting up Python virtual environment in server/.venv…"
+    python3 -m venv "${REPO_DIR}/server/.venv"
+    source "${REPO_DIR}/server/.venv/bin/activate"
+
+    info "Installing Python dependencies…"
+    pip install --upgrade pip -q
+    pip install -q -r "${REPO_DIR}/server/requirements.txt"
+
+    # Try to install CUDA support (optional – won't fail if no GPU)
+    info "Attempting to install cupy for CUDA acceleration (optional)…"
+    pip install -q cupy-cuda12x 2>/dev/null \
+        && info "cupy installed – CUDA GPU acceleration enabled" \
+        || warn "cupy not installed (no CUDA GPU or drivers) – falling back to CPU"
+
+    deactivate
+
+    # Systemd service for the processing server
+    SERVER_SERVICE_FILE="/etc/systemd/system/astro-processing-server.service"
+    SERVER_ENV_FILE="/etc/astro-processing-server.env"
+
+    if [[ ! -f "$SERVER_ENV_FILE" ]]; then
+        info "Creating server environment configuration…"
+        sudo tee "$SERVER_ENV_FILE" > /dev/null << 'EOF'
+# Astro Processing Server configuration
+LOG_LEVEL=info
+WORK_DIR=/tmp/astro-server-jobs
+EOF
+    fi
+
+    info "Writing systemd service file…"
+    sudo tee "$SERVER_SERVICE_FILE" > /dev/null << EOF
+[Unit]
+Description=Astro Remote Processing Server
+After=network.target
+
+[Service]
+Type=simple
+User=${USER}
+WorkingDirectory=${REPO_DIR}/server
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+EnvironmentFile=-${SERVER_ENV_FILE}
+ExecStart=${REPO_DIR}/server/.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8069 --log-level \${LOG_LEVEL}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable astro-processing-server.service
+
+    if ! $DEV_MODE; then
+        sudo systemctl start astro-processing-server.service
+        IP=$(hostname -I | awk '{print $1}')
+        info "Remote processing server installed and running!"
+        echo
+        echo "  Server URL: http://${IP}:8069"
+        echo "  Health check: curl http://${IP}:8069/api/health"
+        echo "  Service status: sudo systemctl status astro-processing-server"
+        echo "  View logs: journalctl -u astro-processing-server -f"
+        echo
+        echo "  On the Raspberry Pi, set this in /etc/gphoto2-astro-webui.env:"
+        echo "    REMOTE_SERVER=http://${IP}:8069"
+        echo "  Then restart the Pi service:"
+        echo "    sudo systemctl restart gphoto2-astro-webui"
+    else
+        info "Server installed (dev mode – not started)."
+        echo
+        echo "  Start manually:"
+        echo "    cd ${REPO_DIR}/server && source .venv/bin/activate"
+        echo "    uvicorn main:app --host 0.0.0.0 --port 8069 --reload"
+    fi
+
+    exit 0
+fi
 
 # ---------------------------------------------------------------------------
 # Detect and offer to remove a locally-built (source-installed) gphoto2.
@@ -410,6 +514,12 @@ if [[ ! -f "$ENV_FILE" ]]; then
 # Log level for the application and uvicorn (debug, info, warning, error, critical).
 # Change to "debug" for verbose logging.
 LOG_LEVEL=info
+
+# Remote processing server URL (optional).
+# When set, stacking and timelapse panels show a "Process on remote server"
+# checkbox that offloads heavy computation to a GPU-equipped machine.
+# Example: REMOTE_SERVER=http://10.0.1.20:8069
+#REMOTE_SERVER=
 EOF
 else
     info "Environment file ${ENV_FILE} already exists – preserving."
