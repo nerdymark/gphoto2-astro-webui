@@ -72,10 +72,6 @@ if $SERVER_MODE; then
         python3 \
         python3-pip \
         python3-venv \
-        libturbojpeg0 \
-        libjpeg-dev \
-        zlib1g-dev \
-        libopenblas0 \
         ffmpeg
 
     # Python virtual environment
