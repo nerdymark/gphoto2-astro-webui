@@ -37,6 +37,11 @@ MAX_RETRIES = int(os.environ.get("REMOTE_MAX_RETRIES", "6"))
 INITIAL_BACKOFF = float(os.environ.get("REMOTE_INITIAL_BACKOFF", "2"))
 MAX_BACKOFF = float(os.environ.get("REMOTE_MAX_BACKOFF", "60"))
 
+# Poll loop is much more patient — the remote server is doing real work,
+# so we should tolerate long WiFi drops (default: 30 failures × 60s max
+# backoff ≈ up to ~30 minutes of network outage).
+POLL_MAX_FAILURES = int(os.environ.get("REMOTE_POLL_MAX_FAILURES", "30"))
+
 
 def is_configured() -> bool:
     """Return True if remote processing is configured."""
@@ -245,6 +250,8 @@ def process_remote(
         )
 
         # Step 4: Poll for completion (with retry on transient errors)
+        # Use POLL_MAX_FAILURES which is much higher than MAX_RETRIES —
+        # the server is doing real work and WiFi can drop for minutes.
         consecutive_failures = 0
         poll_backoff = INITIAL_BACKOFF
 
@@ -263,11 +270,16 @@ def process_remote(
                     max_retries=2,  # Light retry per poll cycle
                 )
                 status = json.loads(resp_body)
+                if consecutive_failures > 0:
+                    logger.info(
+                        "Remote job %s: reconnected after %d poll failure(s)",
+                        job_id, consecutive_failures,
+                    )
                 consecutive_failures = 0
                 poll_backoff = INITIAL_BACKOFF
             except Exception as exc:
                 consecutive_failures += 1
-                if consecutive_failures > MAX_RETRIES:
+                if consecutive_failures > POLL_MAX_FAILURES:
                     logger.error(
                         "Remote job %s: lost contact after %d consecutive poll failures",
                         job_id, consecutive_failures,
@@ -280,10 +292,10 @@ def process_remote(
                 wait = min(poll_backoff, MAX_BACKOFF)
                 logger.warning(
                     "Remote job %s: poll failed (%d/%d): %s — retrying in %.0fs",
-                    job_id, consecutive_failures, MAX_RETRIES, exc, wait,
+                    job_id, consecutive_failures, POLL_MAX_FAILURES, exc, wait,
                 )
                 if on_progress:
-                    on_progress("reconnecting", consecutive_failures, MAX_RETRIES)
+                    on_progress("reconnecting", consecutive_failures, POLL_MAX_FAILURES)
                 time.sleep(wait)
                 poll_backoff *= 2
                 continue
@@ -298,9 +310,7 @@ def process_remote(
             if status["status"] == "completed":
                 break
             elif status["status"] in ("failed", "cancelled"):
-                raise RuntimeError(
-                    f"Remote job failed: {status.get('error', 'unknown')}"
-                )
+                raise RuntimeError(_format_remote_error(status))
 
         # Step 5: Download result (with retry)
         if on_progress:
@@ -465,7 +475,7 @@ def finalize_and_download(
         on_retry=_log_retry,
     )
 
-    # Poll for completion
+    # Poll for completion — use POLL_MAX_FAILURES for long WiFi outage tolerance
     consecutive_failures = 0
     poll_backoff = INITIAL_BACKOFF
 
@@ -484,11 +494,16 @@ def finalize_and_download(
                 max_retries=2,
             )
             status = json.loads(resp_body)
+            if consecutive_failures > 0:
+                logger.info(
+                    "Remote job %s: reconnected after %d poll failure(s)",
+                    job_id, consecutive_failures,
+                )
             consecutive_failures = 0
             poll_backoff = INITIAL_BACKOFF
         except Exception as exc:
             consecutive_failures += 1
-            if consecutive_failures > MAX_RETRIES:
+            if consecutive_failures > POLL_MAX_FAILURES:
                 raise RuntimeError(
                     f"Lost connection to remote server after {consecutive_failures} "
                     f"poll failures: {exc}"
@@ -497,10 +512,10 @@ def finalize_and_download(
             wait = min(poll_backoff, MAX_BACKOFF)
             logger.warning(
                 "Remote job %s: poll failed (%d/%d): %s — retrying in %.0fs",
-                job_id, consecutive_failures, MAX_RETRIES, exc, wait,
+                job_id, consecutive_failures, POLL_MAX_FAILURES, exc, wait,
             )
             if on_progress:
-                on_progress("reconnecting", consecutive_failures, MAX_RETRIES)
+                on_progress("reconnecting", consecutive_failures, POLL_MAX_FAILURES)
             time.sleep(wait)
             poll_backoff *= 2
             continue
@@ -511,9 +526,7 @@ def finalize_and_download(
         if status["status"] == "completed":
             break
         elif status["status"] in ("failed", "cancelled"):
-            raise RuntimeError(
-                f"Remote job failed: {status.get('error', 'unknown')}"
-            )
+            raise RuntimeError(_format_remote_error(status))
 
     # Download result
     if on_progress:
@@ -545,6 +558,41 @@ def finalize_and_download(
         pass
 
     return output_path
+
+
+def _format_remote_error(status: dict) -> str:
+    """Format a remote job error into a user-friendly message.
+
+    Detects common failures (corrupt images, OOM, etc.) and adds context
+    so the user understands what happened and what to do about it.
+    """
+    error = status.get("error", "unknown")
+    job_status = status.get("status", "failed")
+
+    if job_status == "cancelled":
+        return f"Remote job was cancelled: {error}"
+
+    # Corrupt/unreadable image on remote server
+    if "cannot identify image file" in error or "truncated" in error.lower():
+        # Extract filename if present
+        import re
+        match = re.search(r"['\"]([^'\"]+\.\w{2,4})['\"]", error)
+        filename = match.group(1) if match else "unknown"
+        return (
+            f"Remote server encountered a corrupt/unreadable image ({filename}). "
+            f"This usually means an image was partially uploaded due to a network "
+            f"drop. The remote server needs the latest stacking.py/timelapse.py "
+            f"which skip corrupt images instead of crashing. Original error: {error}"
+        )
+
+    # Out of memory
+    if "MemoryError" in error or "OOM" in error or "out of memory" in error.lower():
+        return (
+            f"Remote server ran out of memory during processing. "
+            f"Try reducing the number of images or resolution. Original error: {error}"
+        )
+
+    return f"Remote job failed: {error}"
 
 
 def _upload_batch_with_retry(job_id: str, paths: list[Path], on_retry=None):

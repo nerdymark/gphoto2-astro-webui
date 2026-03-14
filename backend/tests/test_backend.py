@@ -1843,3 +1843,78 @@ def test_debug_messages_emitted_when_log_level_debug(monkeypatch, caplog):
         cam.logger.debug("test debug message from camera")
 
     assert any("test debug message from camera" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Remote module tests
+# ---------------------------------------------------------------------------
+
+
+class TestRemoteModule:
+    """Tests for remote.py resilience improvements."""
+
+    def test_format_remote_error_corrupt_image(self):
+        import remote
+        status = {
+            "status": "failed",
+            "error": "cannot identify image file '/tmp/jobs/abc/images/000171_photo.jpg'",
+        }
+        msg = remote._format_remote_error(status)
+        assert "corrupt/unreadable image" in msg
+        assert "000171_photo.jpg" in msg
+        assert "skip corrupt images" in msg
+
+    def test_format_remote_error_truncated(self):
+        import remote
+        status = {
+            "status": "failed",
+            "error": "image file is Truncated",
+        }
+        msg = remote._format_remote_error(status)
+        assert "corrupt/unreadable image" in msg
+
+    def test_format_remote_error_oom(self):
+        import remote
+        status = {
+            "status": "failed",
+            "error": "MemoryError: unable to allocate array",
+        }
+        msg = remote._format_remote_error(status)
+        assert "out of memory" in msg.lower() or "ran out of memory" in msg.lower()
+
+    def test_format_remote_error_cancelled(self):
+        import remote
+        status = {
+            "status": "cancelled",
+            "error": "user cancelled",
+        }
+        msg = remote._format_remote_error(status)
+        assert "cancelled" in msg
+
+    def test_format_remote_error_generic(self):
+        import remote
+        status = {
+            "status": "failed",
+            "error": "something unexpected happened",
+        }
+        msg = remote._format_remote_error(status)
+        assert "Remote job failed" in msg
+        assert "something unexpected happened" in msg
+
+    def test_poll_max_failures_default(self):
+        import remote
+        assert remote.POLL_MAX_FAILURES >= 20, (
+            "POLL_MAX_FAILURES should be high enough to survive long WiFi outages"
+        )
+
+    def test_poll_max_failures_env_override(self, monkeypatch):
+        monkeypatch.setenv("REMOTE_POLL_MAX_FAILURES", "50")
+        # Re-import to pick up env var
+        if "remote" in sys.modules:
+            del sys.modules["remote"]
+        import remote
+        assert remote.POLL_MAX_FAILURES == 50
+        # Restore default
+        monkeypatch.delenv("REMOTE_POLL_MAX_FAILURES")
+        if "remote" in sys.modules:
+            del sys.modules["remote"]
