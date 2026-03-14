@@ -249,6 +249,9 @@ async def capture_burst(req: BurstRequest):
                     remote_job_ids["timelapse"] = rid
                     job.log(f"Created remote timelapse job {rid}")
 
+            # Track images that failed to upload so we can retry before finalize
+            failed_uploads = {}  # remote_job_id -> [Path, ...]
+
             def on_progress(frame_idx, total, saved_path):
                 msg = (f"Frame {frame_idx + 1}/{total}"
                        + (f" saved {saved_path.name}" if saved_path else " FAILED"))
@@ -256,11 +259,17 @@ async def capture_burst(req: BurstRequest):
 
                 # Stream each captured frame to remote server(s)
                 if saved_path and use_remote and remote_job_ids:
-                    try:
-                        for rid in remote_job_ids.values():
-                            remote.upload_single_image(rid, saved_path)
-                    except Exception as upload_exc:
-                        job.log(f"Warning: remote upload failed for {saved_path.name}: {upload_exc}")
+                    for rid in remote_job_ids.values():
+                        try:
+                            remote.upload_single_image(
+                                rid, saved_path,
+                                on_retry=lambda a, w, e: job.log(
+                                    f"Upload retry {a} for {saved_path.name}: {e}"
+                                ),
+                            )
+                        except Exception as upload_exc:
+                            job.log(f"Warning: remote upload failed for {saved_path.name}: {upload_exc}")
+                            failed_uploads.setdefault(rid, []).append(saved_path)
 
             saved = cam.capture_burst(
                 gallery_dir,
@@ -282,6 +291,23 @@ async def capture_burst(req: BurstRequest):
                     for p in saved
                 ],
             }
+
+            # --- Retry any failed streaming uploads before finalizing ---
+            if failed_uploads:
+                total_failed = sum(len(v) for v in failed_uploads.values())
+                job.log(f"Retrying {total_failed} failed upload(s) before finalize…")
+                for rid, paths in list(failed_uploads.items()):
+                    still_failed = remote.retry_failed_uploads(
+                        rid, paths,
+                        on_retry=lambda a, w, e: job.log(f"Re-upload retry {a}: {e}"),
+                    )
+                    if still_failed:
+                        job.log(
+                            f"Warning: {len(still_failed)} image(s) could not be "
+                            f"uploaded to remote job {rid} after retries"
+                        )
+                    else:
+                        job.log(f"All failed uploads recovered for remote job {rid}")
 
             # --- Post-processing ---
             post_job_ids = {}
