@@ -1502,6 +1502,203 @@ class TestAPI:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("image/")
 
+    def test_burst_with_stack_post_processing(self, client, tmp_path):
+        """Burst capture with stack post-processing creates a stacking job."""
+        import camera as cam
+        import main
+
+        main.GALLERY_ROOT = tmp_path
+        client.post("/api/galleries", json={"name": "burst_stack"})
+
+        with patch.object(cam, "GPHOTO2_BIN", None):
+            resp = client.post(
+                "/api/camera/burst",
+                json={
+                    "gallery": "burst_stack",
+                    "count": 3,
+                    "interval": 0,
+                    "stack": {"mode": "mean"},
+                },
+            )
+        assert resp.status_code == 202
+        data = resp.json()
+        assert "job_id" in data
+
+        # Poll burst job until complete
+        for _ in range(60):
+            job_resp = client.get(f"/api/jobs/{data['job_id']}")
+            job_data = job_resp.json()
+            if job_data["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.1)
+
+        assert job_data["status"] == "completed"
+        result = job_data["result"]
+        assert result["captured"] == 3
+        assert "stack_job_id" in result
+
+        # Poll the stack sub-job
+        stack_job_id = result["stack_job_id"]
+        for _ in range(60):
+            stack_resp = client.get(f"/api/jobs/{stack_job_id}")
+            stack_data = stack_resp.json()
+            if stack_data["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.1)
+
+        assert stack_data["status"] == "completed"
+        stack_result = stack_data["result"]
+        assert stack_result["ok"] is True
+        assert stack_result["filename"].startswith("stacked-mean-")
+
+    def test_burst_with_timelapse_post_processing(self, client, tmp_path):
+        """Burst capture with timelapse post-processing creates a timelapse job."""
+        import camera as cam
+        import main
+
+        main.GALLERY_ROOT = tmp_path
+        client.post("/api/galleries", json={"name": "burst_tl"})
+
+        with patch.object(cam, "GPHOTO2_BIN", None):
+            resp = client.post(
+                "/api/camera/burst",
+                json={
+                    "gallery": "burst_tl",
+                    "count": 3,
+                    "interval": 0,
+                    "timelapse": {"fps": 24, "resolution": "1280x720"},
+                },
+            )
+        assert resp.status_code == 202
+        data = resp.json()
+        job_id = data["job_id"]
+
+        # Poll burst job until complete
+        for _ in range(60):
+            job_resp = client.get(f"/api/jobs/{job_id}")
+            job_data = job_resp.json()
+            if job_data["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.1)
+
+        assert job_data["status"] == "completed"
+        result = job_data["result"]
+        assert result["captured"] == 3
+        assert "timelapse_job_id" in result
+
+    def test_burst_with_both_stack_and_timelapse(self, client, tmp_path):
+        """Burst capture can request both stack and timelapse simultaneously."""
+        import camera as cam
+        import main
+
+        main.GALLERY_ROOT = tmp_path
+        client.post("/api/galleries", json={"name": "burst_both"})
+
+        with patch.object(cam, "GPHOTO2_BIN", None):
+            resp = client.post(
+                "/api/camera/burst",
+                json={
+                    "gallery": "burst_both",
+                    "count": 3,
+                    "interval": 0,
+                    "stack": {"mode": "max"},
+                    "timelapse": {"fps": 30, "resolution": "1920x1080"},
+                },
+            )
+        assert resp.status_code == 202
+        data = resp.json()
+
+        # Poll burst job
+        for _ in range(60):
+            job_resp = client.get(f"/api/jobs/{data['job_id']}")
+            job_data = job_resp.json()
+            if job_data["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.1)
+
+        assert job_data["status"] == "completed"
+        result = job_data["result"]
+        assert "stack_job_id" in result
+        assert "timelapse_job_id" in result
+        assert result["stack_job_id"] != result["timelapse_job_id"]
+
+    def test_burst_no_post_processing_unchanged(self, client, tmp_path):
+        """Burst without post-processing works as before (no sub-job IDs)."""
+        import camera as cam
+        import main
+
+        main.GALLERY_ROOT = tmp_path
+        client.post("/api/galleries", json={"name": "burst_plain"})
+
+        with patch.object(cam, "GPHOTO2_BIN", None):
+            resp = client.post(
+                "/api/camera/burst",
+                json={"gallery": "burst_plain", "count": 2, "interval": 0},
+            )
+        assert resp.status_code == 202
+
+        for _ in range(60):
+            job_resp = client.get(f"/api/jobs/{resp.json()['job_id']}")
+            job_data = job_resp.json()
+            if job_data["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.1)
+
+        assert job_data["status"] == "completed"
+        result = job_data["result"]
+        assert result["captured"] == 2
+        assert "stack_job_id" not in result
+        assert "timelapse_job_id" not in result
+
+    def test_burst_invalid_stack_mode(self, client, tmp_path):
+        """Burst with invalid stack mode returns 400."""
+        import main
+
+        main.GALLERY_ROOT = tmp_path
+        client.post("/api/galleries", json={"name": "burst_bad"})
+        resp = client.post(
+            "/api/camera/burst",
+            json={
+                "gallery": "burst_bad",
+                "count": 3,
+                "stack": {"mode": "invalid"},
+            },
+        )
+        assert resp.status_code == 400
+
+    def test_burst_single_frame_skips_post_processing(self, client, tmp_path):
+        """Post-processing requires >= 2 captured frames; single-frame burst skips it."""
+        import camera as cam
+        import main
+
+        main.GALLERY_ROOT = tmp_path
+        client.post("/api/galleries", json={"name": "burst_one"})
+
+        with patch.object(cam, "GPHOTO2_BIN", None):
+            resp = client.post(
+                "/api/camera/burst",
+                json={
+                    "gallery": "burst_one",
+                    "count": 1,
+                    "stack": {"mode": "mean"},
+                    "timelapse": {"fps": 30, "resolution": "1920x1080"},
+                },
+            )
+        assert resp.status_code == 202
+
+        for _ in range(60):
+            job_resp = client.get(f"/api/jobs/{resp.json()['job_id']}")
+            job_data = job_resp.json()
+            if job_data["status"] in ("completed", "failed"):
+                break
+            time.sleep(0.1)
+
+        assert job_data["status"] == "completed"
+        result = job_data["result"]
+        # Only 1 frame captured, so no post-processing jobs spawned
+        assert "stack_job_id" not in result
+        assert "timelapse_job_id" not in result
+
 
 # ---------------------------------------------------------------------------
 # LOG_LEVEL env var tests

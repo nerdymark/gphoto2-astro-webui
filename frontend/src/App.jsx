@@ -113,6 +113,7 @@ export default function App() {
               <CapturePanel
                 gallery={selectedGallery}
                 onCapture={handleCapture}
+                remoteStatus={remoteStatus}
               />
             )}
             {tab === "Gallery" && (

@@ -80,11 +80,25 @@ class CaptureRequest(BaseModel):
     bulb_seconds: Optional[int] = None
 
 
+class BurstStackOptions(BaseModel):
+    mode: str = "mean"
+    output_name: Optional[str] = None
+
+
+class BurstTimelapseOptions(BaseModel):
+    fps: int = 30
+    resolution: str = "1920x1080"
+    output_name: Optional[str] = None
+
+
 class BurstRequest(BaseModel):
     gallery: str
     count: int = 1
     interval: float = 0
     bulb_seconds: Optional[int] = None
+    stack: Optional[BurstStackOptions] = None
+    timelapse: Optional[BurstTimelapseOptions] = None
+    remote: bool = False
 
 
 class StackRequest(BaseModel):
@@ -178,29 +192,75 @@ def capture_image(req: CaptureRequest):
 async def capture_burst(req: BurstRequest):
     """Start a burst capture as a background job.
 
+    Optionally triggers stacking and/or timelapse generation after capture
+    completes.  When remote processing is enabled, images are streamed to
+    the remote server as they are captured to overlap transfer and capture.
+
     Returns 202 immediately with a job ID.
     """
     if req.count < 1:
         raise HTTPException(status_code=400, detail="count must be >= 1")
+    if req.stack and req.stack.mode not in ("mean", "max", "align+mean"):
+        raise HTTPException(status_code=400, detail=f"Unknown stacking mode: {req.stack.mode!r}")
     gallery_name = req.gallery
+    want_stack = req.stack is not None
+    want_timelapse = req.timelapse is not None
+    use_remote = req.remote and remote.is_configured()
+
+    label = f"Burst {req.count} frames into {gallery_name}"
+    if want_stack:
+        label += f" + stack ({req.stack.mode})"
+    if want_timelapse:
+        label += f" + timelapse ({req.timelapse.fps}fps)"
+    if use_remote:
+        label += f" [remote: {remote.REMOTE_SERVER}]"
 
     job = jobs.create(
         "burst",
         total=req.count,
-        message=f"Burst {req.count} frames into {gallery_name}",
+        message=label,
     )
 
     def _run_burst():
         jobs.start(job)
+        remote_job_ids = {}  # "stack" / "timelapse" -> remote job_id
         try:
             gallery_dir = _resolve_gallery(gallery_name)
             if gallery_dir is None:
                 raise ValueError(f"Gallery '{gallery_name}' not found")
 
+            # --- Remote streaming setup: create remote jobs before capture ---
+            if use_remote and (want_stack or want_timelapse):
+                if want_stack:
+                    rid = remote.create_remote_job(
+                        job_type="stack",
+                        mode=req.stack.mode,
+                        output_name=req.stack.output_name,
+                    )
+                    remote_job_ids["stack"] = rid
+                    job.log(f"Created remote stack job {rid}")
+                if want_timelapse:
+                    rid = remote.create_remote_job(
+                        job_type="timelapse",
+                        fps=req.timelapse.fps,
+                        resolution=req.timelapse.resolution,
+                        output_name=req.timelapse.output_name,
+                    )
+                    remote_job_ids["timelapse"] = rid
+                    job.log(f"Created remote timelapse job {rid}")
+
             def on_progress(frame_idx, total, saved_path):
                 msg = (f"Frame {frame_idx + 1}/{total}"
                        + (f" saved {saved_path.name}" if saved_path else " FAILED"))
                 jobs.update_progress(job, frame_idx + 1, msg)
+
+                # Stream each captured frame to remote server(s)
+                if saved_path and use_remote and remote_job_ids:
+                    try:
+                        for rid in remote_job_ids.values():
+                            remote.upload_single_image(rid, saved_path)
+                    except Exception as upload_exc:
+                        job.log(f"Warning: remote upload failed for {saved_path.name}: {upload_exc}")
 
             saved = cam.capture_burst(
                 gallery_dir,
@@ -210,7 +270,9 @@ async def capture_burst(req: BurstRequest):
                 on_progress=on_progress,
                 cancel_check=lambda: job.cancelled,
             )
-            jobs.complete(job, {
+
+            filenames = [p.name for p in saved]
+            result = {
                 "ok": True,
                 "gallery": gallery_name,
                 "captured": len(saved),
@@ -219,12 +281,202 @@ async def capture_burst(req: BurstRequest):
                     {"filename": p.name, "url": f"/api/images/{gallery_name}/{p.name}"}
                     for p in saved
                 ],
-            })
+            }
+
+            # --- Post-processing ---
+            post_job_ids = {}
+
+            if want_stack and len(saved) >= 2:
+                stack_opts = req.stack
+                stack_output = stack_opts.output_name or f"stacked-{stack_opts.mode}-{int(time.time())}.jpg"
+
+                if use_remote and "stack" in remote_job_ids:
+                    # Finalize the remote job (images already uploaded)
+                    job.log("Finalizing remote stack job…")
+                    pp_job = _start_remote_finalize_job(
+                        gallery_name, gallery_dir,
+                        remote_job_ids["stack"], "stack", stack_output,
+                    )
+                    post_job_ids["stack_job_id"] = pp_job.id
+                else:
+                    pp_job = _start_local_stack_job(
+                        gallery_name, gallery_dir, filenames,
+                        stack_opts.mode, stack_output,
+                    )
+                    post_job_ids["stack_job_id"] = pp_job.id
+
+            if want_timelapse and len(saved) >= 2:
+                tl_opts = req.timelapse
+                tl_output = tl_opts.output_name or f"timelapse-{tl_opts.fps}fps-{int(time.time())}.mp4"
+
+                if use_remote and "timelapse" in remote_job_ids:
+                    job.log("Finalizing remote timelapse job…")
+                    pp_job = _start_remote_finalize_job(
+                        gallery_name, gallery_dir,
+                        remote_job_ids["timelapse"], "timelapse", tl_output,
+                    )
+                    post_job_ids["timelapse_job_id"] = pp_job.id
+                else:
+                    pp_job = _start_local_timelapse_job(
+                        gallery_name, gallery_dir, filenames,
+                        tl_opts.fps, tl_opts.resolution, tl_output,
+                    )
+                    post_job_ids["timelapse_job_id"] = pp_job.id
+
+            result.update(post_job_ids)
+            jobs.complete(job, result)
+
         except Exception as exc:
+            # Clean up any remote jobs on failure
+            for rid in remote_job_ids.values():
+                try:
+                    remote._cancel_remote(rid)
+                except Exception:
+                    pass
             jobs.fail(job, str(exc))
 
     threading.Thread(target=_run_burst, daemon=True).start()
     return {"job_id": job.id}
+
+
+# ---------------------------------------------------------------------------
+# Burst post-processing helpers
+# ---------------------------------------------------------------------------
+
+
+def _start_local_stack_job(gallery_name, gallery_dir, filenames, mode, output_name):
+    """Kick off a local stacking job for burst post-processing."""
+    pp_job = jobs.create(
+        "stack",
+        total=len(filenames),
+        message=f"Burst post-stack {len(filenames)} images ({mode})",
+    )
+
+    def _run():
+        jobs.start(pp_job)
+        try:
+            paths = [gallery_dir / fn for fn in filenames]
+            missing = [fn for fn, p in zip(filenames, paths) if not p.exists()]
+            if missing:
+                raise FileNotFoundError(f"Images not found: {', '.join(missing)}")
+
+            pp_job.log(f"Stacking {len(paths)} images, mode={mode}")
+
+            def on_progress(processed, total):
+                jobs.update_progress(pp_job, processed, f"Processing image {processed}/{total}")
+
+            result_image = stk.stack_images(paths, mode=mode, on_progress=on_progress)
+            output_path = gallery_dir / output_name
+            result_image.save(str(output_path), format="JPEG", quality=95)
+            jobs.complete(pp_job, {
+                "ok": True,
+                "gallery": gallery_name,
+                "filename": output_name,
+                "url": f"/api/images/{gallery_name}/{output_name}",
+            })
+        except Exception as exc:
+            jobs.fail(pp_job, str(exc))
+
+    threading.Thread(target=_run, daemon=True).start()
+    return pp_job
+
+
+def _start_local_timelapse_job(gallery_name, gallery_dir, filenames, fps, resolution, output_name):
+    """Kick off a local timelapse job for burst post-processing."""
+    pp_job = jobs.create(
+        "timelapse",
+        total=len(filenames),
+        message=f"Burst post-timelapse {len(filenames)} images @ {fps}fps {resolution}",
+    )
+
+    def _run():
+        pp_job.log("Waiting for timelapse slot (limit: 1 concurrent)…")
+        acquired = timelapse_semaphore.acquire(timeout=0)
+        if not acquired:
+            pp_job.log("Another timelapse is running, queued…")
+            timelapse_semaphore.acquire()
+        jobs.start(pp_job)
+        try:
+            paths = [gallery_dir / fn for fn in filenames]
+            missing = [fn for fn, p in zip(filenames, paths) if not p.exists()]
+            if missing:
+                raise FileNotFoundError(f"Images not found: {', '.join(missing)}")
+
+            pp_job.log(f"Generating {fps}fps {resolution} timelapse from {len(paths)} images")
+            pp_job.log(f"ffmpeg threads limited to {FFMPEG_THREADS}")
+
+            def on_progress(phase, processed, total):
+                if phase == "resize":
+                    jobs.update_progress(pp_job, processed, f"Resizing image {processed}/{total}")
+                else:
+                    jobs.update_progress(pp_job, processed, f"Encoding frame {processed}/{total}")
+
+            output_path = gallery_dir / output_name
+            tl.generate_timelapse(
+                paths, output_path,
+                fps=fps, resolution=resolution,
+                threads=FFMPEG_THREADS,
+                on_progress=on_progress,
+                cancel_check=lambda: pp_job.cancelled,
+            )
+            file_size_mb = output_path.stat().st_size / (1024 * 1024)
+            jobs.complete(pp_job, {
+                "ok": True,
+                "gallery": gallery_name,
+                "filename": output_name,
+                "url": f"/api/videos/{gallery_name}/{output_name}",
+                "size_mb": round(file_size_mb, 1),
+            })
+        except Exception as exc:
+            jobs.fail(pp_job, str(exc))
+        finally:
+            timelapse_semaphore.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return pp_job
+
+
+def _start_remote_finalize_job(gallery_name, gallery_dir, remote_job_id, job_type, output_name):
+    """Finalize a pre-populated remote job, poll for result, and download."""
+    pp_job = jobs.create(
+        job_type,
+        total=1,
+        message=f"Remote {job_type}: finalizing & downloading",
+    )
+
+    def _run():
+        jobs.start(pp_job)
+        try:
+            def on_progress(phase, processed, total):
+                jobs.update_progress(pp_job, processed, f"{phase.capitalize()}: {processed}/{total}")
+
+            result_path = remote.finalize_and_download(
+                remote_job_id,
+                job_type=job_type,
+                output_name=output_name,
+                output_dir=gallery_dir,
+                on_progress=on_progress,
+                cancel_check=lambda: pp_job.cancelled,
+            )
+
+            result_data = {
+                "ok": True,
+                "gallery": gallery_name,
+                "filename": result_path.name,
+                "remote": True,
+            }
+            if job_type == "timelapse":
+                result_data["url"] = f"/api/videos/{gallery_name}/{result_path.name}"
+                result_data["size_mb"] = round(result_path.stat().st_size / (1024 * 1024), 1)
+            else:
+                result_data["url"] = f"/api/images/{gallery_name}/{result_path.name}"
+
+            jobs.complete(pp_job, result_data)
+        except Exception as exc:
+            jobs.fail(pp_job, str(exc))
+
+    threading.Thread(target=_run, daemon=True).start()
+    return pp_job
 
 
 # ---------------------------------------------------------------------------
