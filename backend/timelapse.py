@@ -25,23 +25,31 @@ def check_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def _resize_image(src: Path, dst: Path, width: int, height: int) -> None:
+def _resize_image(src: Path, dst: Path, width: int, height: int) -> bool:
     """Resize a single image to fit within width x height, with black padding.
 
     Processes one image at a time to keep memory usage minimal on low-RAM
     devices like Raspberry Pi 2.
+
+    Returns True on success, False if the image is corrupt/unreadable.
     """
-    with Image.open(src) as img:
-        img.thumbnail((width, height), Image.LANCZOS)
-        # Create black canvas at target size and paste centered
-        canvas = Image.new("RGB", (width, height), (0, 0, 0))
-        x = (width - img.width) // 2
-        y = (height - img.height) // 2
-        # Convert to RGB if needed (handles RGBA, palette, etc.)
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        canvas.paste(img, (x, y))
-        canvas.save(dst, "JPEG", quality=92)
+    try:
+        with Image.open(src) as img:
+            img.load()  # Force full decode to catch truncated/corrupt data
+            img.thumbnail((width, height), Image.LANCZOS)
+            # Create black canvas at target size and paste centered
+            canvas = Image.new("RGB", (width, height), (0, 0, 0))
+            x = (width - img.width) // 2
+            y = (height - img.height) // 2
+            # Convert to RGB if needed (handles RGBA, palette, etc.)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            canvas.paste(img, (x, y))
+            canvas.save(dst, "JPEG", quality=92)
+        return True
+    except Exception as exc:
+        logger.warning("Skipping corrupt/unreadable image %s: %s", src.name, exc)
+        return False
 
 
 def generate_timelapse(
@@ -104,19 +112,31 @@ def generate_timelapse(
     concat_file = None
     try:
         resized_paths = []
+        skipped = 0
         logger.info("Pre-resizing %d images to %dx%d ...", total, width, height)
         for i, p in enumerate(image_paths):
             if cancel_check and cancel_check():
                 raise RuntimeError("Timelapse generation cancelled")
 
             dst = Path(tmp_dir) / f"frame_{i:06d}.jpg"
-            _resize_image(p, dst, width, height)
-            resized_paths.append(dst)
+            if _resize_image(p, dst, width, height):
+                resized_paths.append(dst)
+            else:
+                skipped += 1
 
             if on_progress:
                 on_progress("resize", i + 1, total)
 
-        logger.info("Pre-resize complete, building ffmpeg concat list")
+        if skipped:
+            logger.warning("Timelapse: skipped %d corrupt/unreadable image(s)", skipped)
+
+        if len(resized_paths) < 2:
+            raise ValueError(
+                f"Not enough readable images for a timelapse "
+                f"({len(resized_paths)} readable, {skipped} skipped)"
+            )
+
+        logger.info("Pre-resize complete (%d frames), building ffmpeg concat list", len(resized_paths))
 
         # Phase 2: Build concat demuxer file from pre-resized frames.
         frame_duration = 1.0 / fps
