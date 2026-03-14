@@ -1326,6 +1326,67 @@ class TestStackingModule:
         )
         assert result.size == (64, 64)
 
+    def test_mean_stack_skips_corrupt_image(self, tmp_path):
+        """Corrupt images are skipped during mean stacking, not fatal."""
+        import stacking
+
+        paths = [
+            self._make_image(tmp_path, "a.jpg", (100, 100, 100)),
+            tmp_path / "corrupt.jpg",
+            self._make_image(tmp_path, "c.jpg", (200, 200, 200)),
+        ]
+        # Write invalid JPEG data
+        paths[1].write_bytes(b"\xff\xd8\xff\xe0JUNK_DATA_NOT_A_REAL_JPEG")
+
+        result = stacking.stack_images(paths, mode="mean")
+        # Should succeed with the 2 good images (mean of 100 and 200 = ~150)
+        import numpy as np
+        arr = np.array(result)
+        assert abs(int(arr[0, 0, 0]) - 150) <= 15
+
+    def test_max_stack_skips_corrupt_image(self, tmp_path):
+        """Corrupt images are skipped during max stacking, not fatal."""
+        import stacking
+
+        paths = [
+            self._make_image(tmp_path, "a.jpg", (50, 50, 50)),
+            tmp_path / "corrupt.jpg",
+            self._make_image(tmp_path, "c.jpg", (200, 100, 100)),
+        ]
+        paths[1].write_bytes(b"\xff\xd8\xff\xe0JUNK")
+
+        result = stacking.stack_images(paths, mode="max")
+        import numpy as np
+        arr = np.array(result)
+        assert arr[:, :, 0].max() == 200
+
+    def test_stack_all_corrupt_raises(self, tmp_path):
+        """If all images are corrupt, stacking raises ValueError."""
+        import stacking
+
+        paths = [tmp_path / "bad1.jpg", tmp_path / "bad2.jpg"]
+        for p in paths:
+            p.write_bytes(b"NOT_A_JPEG")
+
+        with pytest.raises(ValueError, match="No readable images"):
+            stacking.stack_images(paths, mode="mean")
+
+    def test_stack_corrupt_first_image_still_works(self, tmp_path):
+        """When the first image is corrupt, stacking uses the next readable one as reference."""
+        import stacking
+
+        paths = [
+            tmp_path / "corrupt.jpg",
+            self._make_image(tmp_path, "b.jpg", (100, 100, 100)),
+            self._make_image(tmp_path, "c.jpg", (200, 200, 200)),
+        ]
+        paths[0].write_bytes(b"\xff\xd8\xff\xe0TRUNCATED")
+
+        result = stacking.stack_images(paths, mode="mean")
+        import numpy as np
+        arr = np.array(result)
+        assert abs(int(arr[0, 0, 0]) - 150) <= 15
+
 
 # ---------------------------------------------------------------------------
 # FastAPI endpoint tests

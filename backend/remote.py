@@ -379,13 +379,58 @@ def create_remote_job(
     return job_id
 
 
-def upload_single_image(job_id: str, image_path: Path):
+def upload_single_image(job_id: str, image_path: Path, on_retry=None):
     """Upload a single image to an existing remote job.
 
     Used during burst capture to stream images as they are captured,
     overlapping network transfer with camera capture.
+
+    Raises on failure after retries so the caller can track which
+    images need re-uploading.
     """
-    _upload_batch_with_retry(job_id, [image_path])
+    def _log_retry(attempt, wait, exc):
+        logger.info(
+            "Remote upload retry %d for %s: waiting %.0fs after %s",
+            attempt, image_path.name, wait, exc,
+        )
+        if on_retry:
+            on_retry(attempt, wait, exc)
+
+    _upload_batch_with_retry(job_id, [image_path], on_retry=_log_retry)
+
+
+def retry_failed_uploads(job_id: str, failed_paths: list[Path], on_retry=None) -> list[Path]:
+    """Re-upload images that failed during burst streaming.
+
+    Uploads in batches with full retry logic.  Returns the list of
+    paths that still failed after all retries (empty on full success).
+    """
+    if not failed_paths:
+        return []
+
+    still_failed = []
+    total = len(failed_paths)
+
+    def _log_retry(attempt, wait, exc):
+        logger.info("Retry %d: waiting %.0fs after %s", attempt, wait, exc)
+        if on_retry:
+            on_retry(attempt, wait, exc)
+
+    for batch_start in range(0, total, UPLOAD_BATCH_SIZE):
+        batch = failed_paths[batch_start:batch_start + UPLOAD_BATCH_SIZE]
+        try:
+            _upload_batch_with_retry(job_id, batch, on_retry=_log_retry)
+            logger.info(
+                "Remote job %s: re-uploaded %d/%d failed images",
+                job_id, min(batch_start + UPLOAD_BATCH_SIZE, total), total,
+            )
+        except Exception as exc:
+            logger.error(
+                "Remote job %s: batch re-upload still failing: %s", job_id, exc
+            )
+            still_failed.extend(batch)
+
+    return still_failed
 
 
 def finalize_and_download(

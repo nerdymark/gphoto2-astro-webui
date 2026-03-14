@@ -54,11 +54,20 @@ def stack_images(
 
     logger.info("Stacking %d images with mode=%r", len(image_paths), mode)
 
-    # Determine reference size from first image.
-    first = Image.open(image_paths[0]).convert("RGB")
-    reference_size = first.size
+    # Determine reference size from first readable image.
+    reference_size = None
+    for p in image_paths:
+        try:
+            with Image.open(p) as probe:
+                probe.load()
+                reference_size = probe.size
+            break
+        except Exception as exc:
+            logger.warning("Skipping corrupt/unreadable image %s: %s", p.name, exc)
+    if reference_size is None:
+        raise ValueError("No readable images found for stacking")
+
     width, height = reference_size
-    first.close()
 
     if mode == "max":
         return _stack_max(image_paths, reference_size, width, height, np, on_progress)
@@ -69,8 +78,17 @@ def stack_images(
 
 
 def _open_image(path: Path, reference_size):
-    """Open an image and convert to RGB, resizing if needed."""
-    img = Image.open(path).convert("RGB")
+    """Open an image and convert to RGB, resizing if needed.
+
+    Returns None if the image is corrupt or unreadable.
+    """
+    try:
+        img = Image.open(path)
+        img.load()  # Force full decode to catch truncated/corrupt data
+        img = img.convert("RGB")
+    except Exception as exc:
+        logger.warning("Skipping corrupt/unreadable image %s: %s", path.name, exc)
+        return None
     if img.size != reference_size:
         logger.warning(
             "Image %s has size %s; expected %s – resizing",
@@ -89,20 +107,42 @@ def _stack_max(image_paths, reference_size, width, height, np, on_progress=None)
     n = len(image_paths)
     logger.info("Max-stacking %d images for star trails", n)
 
-    # Start with a writable copy of the first image as the baseline
-    result = np.array(_open_image(image_paths[0], reference_size), dtype=np.uint8)
+    # Find the first readable image as baseline
+    result = None
+    start_idx = 0
+    for i, path in enumerate(image_paths):
+        img = _open_image(path, reference_size)
+        if img is not None:
+            result = np.array(img, dtype=np.uint8)
+            img.close()
+            start_idx = i + 1
+            break
+        if on_progress:
+            on_progress(i + 1, n)
+
+    if result is None:
+        raise ValueError("No readable images found for stacking")
 
     if on_progress:
-        on_progress(1, n)
+        on_progress(start_idx, n)
 
-    for idx, path in enumerate(image_paths[1:], start=2):
+    skipped = start_idx - 1  # images skipped to find baseline
+    for idx, path in enumerate(image_paths[start_idx:], start=start_idx + 1):
         img = _open_image(path, reference_size)
+        if img is None:
+            skipped += 1
+            if on_progress:
+                on_progress(idx, n)
+            continue
         arr = np.asarray(img, dtype=np.uint8)
         np.maximum(result, arr, out=result)
         img.close()
         del arr
         if on_progress:
             on_progress(idx, n)
+
+    if skipped:
+        logger.warning("Max-stack: skipped %d corrupt/unreadable image(s)", skipped)
 
     return Image.fromarray(result, mode="RGB")
 
@@ -172,29 +212,51 @@ def _stack_aligned_mean(image_paths, reference_size, np, on_progress=None):
     n = len(image_paths)
     logger.info("Aligned mean-stacking %d images", n)
 
-    # Load reference
-    ref_img = _open_image(image_paths[0], reference_size)
+    # Find the first readable image as reference
+    ref_img = None
+    start_idx = 0
+    for i, path in enumerate(image_paths):
+        ref_img = _open_image(path, reference_size)
+        if ref_img is not None:
+            start_idx = i + 1
+            break
+        if on_progress:
+            on_progress(i + 1, n)
+
+    if ref_img is None:
+        raise ValueError("No readable images found for stacking")
+
     ref_arr = np.asarray(ref_img, dtype=np.uint8)
     ref_gray = cv2.cvtColor(ref_arr, cv2.COLOR_RGB2GRAY)
 
     # Use float64 accumulator for precision
     accumulator = ref_arr.astype(np.float64)
+    used_count = 1
     if on_progress:
-        on_progress(1, n)
+        on_progress(start_idx, n)
 
-    for idx, path in enumerate(image_paths[1:], start=2):
+    for idx, path in enumerate(image_paths[start_idx:], start=start_idx + 1):
         img = _open_image(path, reference_size)
+        if img is None:
+            if on_progress:
+                on_progress(idx, n)
+            continue
         arr = np.asarray(img, dtype=np.uint8)
 
         aligned = _align_image(arr, ref_gray, np)
         accumulator += aligned.astype(np.float64)
+        used_count += 1
 
         img.close()
         del arr
         if on_progress:
             on_progress(idx, n)
 
-    result = (accumulator / n).astype(np.uint8)
+    skipped = n - used_count
+    if skipped:
+        logger.warning("Aligned mean-stack: skipped %d corrupt/unreadable image(s)", skipped)
+
+    result = (accumulator / used_count).astype(np.uint8)
     return Image.fromarray(result, mode="RGB")
 
 
@@ -244,19 +306,32 @@ def _accumulate_single_pass(image_paths, reference_size, width, strip_ranges, n,
     for y_start, y_end in strip_ranges:
         accumulators.append(np.zeros((y_end - y_start, width, 3), dtype=np.uint32))
 
+    used_count = 0
     for idx, path in enumerate(image_paths):
         if idx % 10 == 0:
             logger.info("  accumulate: image %d/%d", idx + 1, n)
         img = _open_image(path, reference_size)
+        if img is None:
+            if on_progress:
+                on_progress(idx + 1, n)
+            continue
         arr = np.asarray(img, dtype=np.uint8)
         for i, (y_start, y_end) in enumerate(strip_ranges):
             accumulators[i] += arr[y_start:y_end]
         img.close()
         del arr
+        used_count += 1
         if on_progress:
             on_progress(idx + 1, n)
 
-    return _finalize_accumulator(accumulators, n, np)
+    if used_count == 0:
+        raise ValueError("No readable images found for stacking")
+
+    skipped = n - used_count
+    if skipped:
+        logger.warning("Mean-stack: skipped %d corrupt/unreadable image(s)", skipped)
+
+    return _finalize_accumulator(accumulators, used_count, np)
 
 
 def _accumulate_multi_pass(image_paths, reference_size, width, height, strip_ranges, n, np, on_progress=None):
@@ -273,12 +348,14 @@ def _accumulate_multi_pass(image_paths, reference_size, width, height, strip_ran
     )
 
     all_results = []
+    used_count = 0
     for batch_start in range(0, len(strip_ranges), strips_per_pass):
         batch = strip_ranges[batch_start : batch_start + strips_per_pass]
         accumulators = []
         for y_start, y_end in batch:
             accumulators.append(np.zeros((y_end - y_start, width, 3), dtype=np.uint32))
 
+        batch_used = 0
         for idx, path in enumerate(image_paths):
             if idx % 20 == 0:
                 logger.info(
@@ -288,16 +365,31 @@ def _accumulate_multi_pass(image_paths, reference_size, width, height, strip_ran
                     n,
                 )
             img = _open_image(path, reference_size)
+            if img is None:
+                if on_progress:
+                    on_progress(idx + 1, n)
+                continue
             arr = np.asarray(img, dtype=np.uint8)
             for i, (y_start, y_end) in enumerate(batch):
                 accumulators[i] += arr[y_start:y_end]
             img.close()
             del arr
+            batch_used += 1
             if on_progress:
                 on_progress(idx + 1, n)
 
+        if batch_start == 0:
+            used_count = batch_used
+
+        if used_count == 0:
+            raise ValueError("No readable images found for stacking")
+
         for acc in accumulators:
-            all_results.append((acc / n).astype(np.uint8))
+            all_results.append((acc / used_count).astype(np.uint8))
+
+    skipped = n - used_count
+    if skipped:
+        logger.warning("Mean-stack (multi-pass): skipped %d corrupt/unreadable image(s)", skipped)
 
     result = np.concatenate(all_results, axis=0)
     return Image.fromarray(result, mode="RGB")
